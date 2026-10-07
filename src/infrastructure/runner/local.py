@@ -102,6 +102,76 @@ class LocalProcessRunner(HostBackend):
             return self._hosts[host_id].state
         return "asleep"
 
+    async def resolve_lane_cwd(self, lane_id: str) -> str:
+        """Resolve the active filesystem worktree directory for a lane ID."""
+        if lane_id in self._lanes:
+            path = self._lanes[lane_id].worktree_path
+            if os.path.exists(path):
+                return path
+
+        # Query DB for lane and host repository
+        try:
+            from sqlalchemy import select
+            from src.contexts.congruence.models import Host, Lane
+            from src.infrastructure.database.session import AsyncSessionFactory
+
+            async with AsyncSessionFactory() as session:
+                lane = (await session.execute(select(Lane).where(Lane.id == lane_id))).scalar_one_or_none()
+                if lane:
+                    # If lane's worktree_path doesn't exist yet or is empty, ensure worktree is created
+                    if not os.path.exists(lane.worktree_path) or not os.listdir(lane.worktree_path):
+                        host = (await session.execute(select(Host).where(Host.id == lane.host_id))).scalar_one_or_none()
+                        if host:
+                            repo_dir = os.path.join(self.base_workdir, host.id, "repo")
+                            if os.path.exists(os.path.join(repo_dir, ".git")):
+                                if lane.is_pair_lane:
+                                    lane.worktree_path = repo_dir
+                                else:
+                                    # Create worktree
+                                    os.makedirs(os.path.dirname(lane.worktree_path), exist_ok=True)
+                                    proc = await asyncio.create_subprocess_exec(
+                                        "git", "worktree", "add", "-b", lane.branch_name, lane.worktree_path,
+                                        cwd=repo_dir,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE,
+                                    )
+                                    await proc.communicate()
+                                    if proc.returncode != 0:
+                                        proc2 = await asyncio.create_subprocess_exec(
+                                            "git", "worktree", "add", lane.worktree_path, lane.branch_name,
+                                            cwd=repo_dir,
+                                            stdout=asyncio.subprocess.PIPE,
+                                            stderr=asyncio.subprocess.PIPE,
+                                        )
+                                        await proc2.communicate()
+                                await session.commit()
+
+                    if os.path.exists(lane.worktree_path):
+                        return lane.worktree_path
+
+                    # If worktree_path still doesn't exist, fall back to repo dir
+                    host = (await session.execute(select(Host).where(Host.id == lane.host_id))).scalar_one_or_none()
+                    if host:
+                        repo_dir = os.path.join(self.base_workdir, host.id, "repo")
+                        if os.path.exists(repo_dir):
+                            return repo_dir
+
+                # If lane_id is 'main' or 'pair-lane' or slug
+                lane_by_slug = (await session.execute(select(Lane).where((Lane.slug == lane_id) | (Lane.name == lane_id)))).scalars().first()
+                if lane_by_slug and os.path.exists(lane_by_slug.worktree_path):
+                    return lane_by_slug.worktree_path
+
+                # Fallback: check most recently active host repo
+                host = (await session.execute(select(Host).order_by(Host.created_at.desc()))).scalars().first()
+                if host:
+                    repo_dir = os.path.join(self.base_workdir, host.id, "repo")
+                    if os.path.exists(repo_dir):
+                        return repo_dir
+        except Exception:
+            pass
+
+        return self.base_workdir
+
     async def create_lane(
         self, host_id: str, branch_name: str, is_pair_lane: bool = False
     ) -> LaneInfo:
@@ -116,7 +186,29 @@ class LocalProcessRunner(HostBackend):
             lane_path = repo_dir
         else:
             lane_path = worktree_path
-            os.makedirs(lane_path, exist_ok=True)
+            # Check if repo_dir has git repository
+            if os.path.exists(os.path.join(repo_dir, ".git")):
+                # Create actual git worktree
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "git", "worktree", "add", "-b", branch_name, worktree_path,
+                        cwd=repo_dir,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+                    if proc.returncode != 0:
+                        proc2 = await asyncio.create_subprocess_exec(
+                            "git", "worktree", "add", worktree_path, branch_name,
+                            cwd=repo_dir,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        await proc2.communicate()
+                except Exception:
+                    os.makedirs(lane_path, exist_ok=True)
+            else:
+                os.makedirs(lane_path, exist_ok=True)
 
         info = LaneInfo(
             lane_id=lane_id,
@@ -157,12 +249,25 @@ class LocalProcessRunner(HostBackend):
         self, lane_id: str, remote_name: str = "origin"
     ) -> tuple[bool, str]:
         """Push the lane's worktree branch to the upstream remote."""
-        lane = self._lanes.get(lane_id)
-        if not lane:
-            return False, "Lane not found"
+        cwd = await self.resolve_lane_cwd(lane_id)
+        branch_name = "main"
+        if lane_id in self._lanes:
+            branch_name = self._lanes[lane_id].branch_name
+        else:
+            try:
+                from sqlalchemy import select
+                from src.contexts.congruence.models import Lane
+                from src.infrastructure.database.session import AsyncSessionFactory
+                async with AsyncSessionFactory() as session:
+                    l = (await session.execute(select(Lane).where(Lane.id == lane_id))).scalar_one_or_none()
+                    if l:
+                        branch_name = l.branch_name
+            except Exception:
+                pass
+
         proc = await asyncio.create_subprocess_exec(
-            "git", "push", "-u", remote_name, lane.branch_name,
-            cwd=lane.worktree_path,
+            "git", "push", "-u", remote_name, branch_name,
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -179,8 +284,7 @@ class LocalProcessRunner(HostBackend):
     ) -> str:
         import nanoid
         pty_id = f"pty_{nanoid.generate(size=12)}"
-        lane = self._lanes.get(lane_id)
-        cwd = lane.worktree_path if lane else self.base_workdir
+        cwd = await self.resolve_lane_cwd(lane_id)
 
         master_fd, slave_fd = pty.openpty()
         
@@ -189,7 +293,13 @@ class LocalProcessRunner(HostBackend):
         import fcntl
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
 
-        cmd_args = command if isinstance(command, list) else ["/bin/sh", "-c", command]
+        if isinstance(command, list):
+            cmd_args = command
+        elif command in ("/bin/sh", "/bin/zsh", "/bin/bash", "sh", "zsh", "bash"):
+            cmd_args = [command, "-i"]
+        else:
+            cmd_args = ["/bin/sh", "-c", command]
+
 
         merged_env = os.environ.copy()
         if env:
@@ -304,8 +414,7 @@ class LocalProcessRunner(HostBackend):
     async def start_dev_server(
         self, lane_id: str, command: str, port: int = 3000
     ) -> DevServerInfo:
-        lane = self._lanes.get(lane_id)
-        cwd = lane.worktree_path if lane else self.base_workdir
+        cwd = await self.resolve_lane_cwd(lane_id)
         
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -339,11 +448,26 @@ class LocalProcessRunner(HostBackend):
             self._dev_server_info[lane_id].is_running = False
 
     async def get_diff(self, lane_id: str) -> GitDiffInfo:
-        lane = self._lanes.get(lane_id)
-        if not lane or not os.path.exists(lane.worktree_path):
+        cwd = await self.resolve_lane_cwd(lane_id)
+        branch_name = "main"
+        if lane_id in self._lanes:
+            branch_name = self._lanes[lane_id].branch_name
+        else:
+            try:
+                from sqlalchemy import select
+                from src.contexts.congruence.models import Lane
+                from src.infrastructure.database.session import AsyncSessionFactory
+                async with AsyncSessionFactory() as session:
+                    l = (await session.execute(select(Lane).where(Lane.id == lane_id))).scalar_one_or_none()
+                    if l:
+                        branch_name = l.branch_name
+            except Exception:
+                pass
+
+        if not os.path.exists(cwd):
             return GitDiffInfo(
                 lane_id=lane_id,
-                branch_name=lane.branch_name if lane else "main",
+                branch_name=branch_name,
                 files_changed=0,
                 insertions=0,
                 deletions=0,
@@ -352,7 +476,7 @@ class LocalProcessRunner(HostBackend):
 
         proc = await asyncio.create_subprocess_exec(
             "git", "diff", "--stat",
-            cwd=lane.worktree_path,
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -361,7 +485,7 @@ class LocalProcessRunner(HostBackend):
         
         return GitDiffInfo(
             lane_id=lane_id,
-            branch_name=lane.branch_name,
+            branch_name=branch_name,
             files_changed=1 if diff_text else 0,
             insertions=1 if diff_text else 0,
             deletions=0,

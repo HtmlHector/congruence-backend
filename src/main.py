@@ -130,7 +130,9 @@ def create_app() -> FastAPI:
 
     # Real-time WebSocket Gateway & Dev Preview Proxy
     app.include_router(session_ws_router)
+    app.include_router(session_ws_router, prefix="/api/v1")
     app.include_router(proxy_router)
+
 
     return app
 
