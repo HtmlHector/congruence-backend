@@ -41,8 +41,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Initialize schema & seed system roles
     try:
-        from src.infrastructure.database.base import Base
         import src.contexts.congruence.models  # noqa: F401
+        from src.infrastructure.database.base import Base
         is_sqlite = str(async_engine.url).startswith("sqlite")
         async with async_engine.begin() as conn:
             if is_sqlite:

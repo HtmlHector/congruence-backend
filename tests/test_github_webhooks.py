@@ -1,13 +1,9 @@
 """Tests for GitHub webhook event processing and branch/PR synchronization."""
 
-import hashlib
-import hmac
-import json
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from src.config.settings import settings
 from src.infrastructure.database.base import Base
 from src.infrastructure.database.session import get_db, get_db_session
 from src.main import app

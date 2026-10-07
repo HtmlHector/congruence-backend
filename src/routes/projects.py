@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
-
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.contexts.congruence.models import (
@@ -316,6 +315,7 @@ async def clone_and_create_project(
 ) -> dict[str, Any]:
     """Clone a live remote GitHub repository and initialize host worktrees."""
     import re
+
     import nanoid
     slug = re.sub(r"[^a-z0-9-]", "-", payload.name.lower()).strip("-")
     slug = f"{slug}-{nanoid.generate(size=6)}"
@@ -356,7 +356,7 @@ async def clone_and_create_project(
         gh_res = await db.execute(
             select(GitHubAccount).where(
                 GitHubAccount.user_id == "usr_default",
-                GitHubAccount.is_active == True,  # noqa: E712
+                GitHubAccount.is_active == True,
             )
         )
         gh_acc = gh_res.scalar_one_or_none()
@@ -461,6 +461,10 @@ async def create_github_pull_request(
     import nanoid
     pr_number = int(nanoid.generate("123456789", size=3))
 
+    # Fetch project
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+
     # Record publication in database
     publication = Publication(
         lane_id=payload.lane_id,
@@ -532,7 +536,7 @@ async def sleep_project_host(
     await runner.sleep_host(host.id)
 
     host.state = "asleep"
-    host.last_sleep_at = datetime.now(timezone.utc)
+    host.last_sleep_at = datetime.now(UTC)
 
     event = ActivityEvent(
         project_id=project_id,
@@ -560,7 +564,7 @@ async def wake_project_host(
     await runner.wake_host(host.id)
 
     host.state = "awake"
-    host.last_wake_at = datetime.now(timezone.utc)
+    host.last_wake_at = datetime.now(UTC)
 
     event = ActivityEvent(
         project_id=project_id,
@@ -845,9 +849,9 @@ async def get_project_spend(
 
     # Compute current active awake duration
     current_active_seconds = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if host.state == "awake" and host.last_wake_at:
-        wake_dt = host.last_wake_at if host.last_wake_at.tzinfo else host.last_wake_at.replace(tzinfo=timezone.utc)
+        wake_dt = host.last_wake_at if host.last_wake_at.tzinfo else host.last_wake_at.replace(tzinfo=UTC)
         current_active_seconds = max(0, int((now - wake_dt).total_seconds()))
 
     total_awake_seconds_month = host.awake_seconds_month + current_active_seconds
@@ -1029,7 +1033,7 @@ async def checkout_writer_seat(
             "total_usd": 49.0 * payload.quantity,
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to create checkout session: {str(exc)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create checkout session: {exc!s}")
 
 
 

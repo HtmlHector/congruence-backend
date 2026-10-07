@@ -1,8 +1,7 @@
-"""GitHub REST API client for interacting with repositories, users, and pull requests."""
-
 from __future__ import annotations
 
-from typing import Any
+import types
+from typing import Any, Self
 
 import httpx
 
@@ -113,8 +112,13 @@ class GitHubClient:
         """Close the underlying HTTP client session."""
         await self._client.aclose()
 
-    async def __aenter__(self) -> GitHubClient:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
         await self.close()

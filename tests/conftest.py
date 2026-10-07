@@ -41,14 +41,14 @@ class MockResult:
         if not self._rows:
             return None
         row = self._rows[0]
-        if isinstance(row, tuple) or isinstance(row, list):
+        if isinstance(row, (tuple, list)):
             return row[0] if row else None
         return row
 
     def scalars(self):
         items = []
         for r in self._rows:
-            if isinstance(r, tuple) or isinstance(r, list):
+            if isinstance(r, (tuple, list)):
                 items.append(r[0] if r else None)
             else:
                 items.append(r)

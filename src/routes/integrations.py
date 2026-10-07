@@ -15,8 +15,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -43,8 +42,8 @@ from src.infrastructure.auth.harness_login import (
     registry,
 )
 from src.infrastructure.database.session import get_db_session
-from src.infrastructure.github.client import GitHubClient, GitHubClientError
-from src.infrastructure.github.oauth import GitHubOAuth, GitHubOAuthError
+from src.infrastructure.github.client import GitHubClient
+from src.infrastructure.github.oauth import GitHubOAuth
 
 router = APIRouter(prefix="/integrations", tags=["Integrations & OAuth"])
 
@@ -101,7 +100,7 @@ async def github_oauth_callback(
         token_data = await oauth.exchange_code(code)
     except Exception as exc:
         return RedirectResponse(
-            url=f"{frontend_base}/workspace?github_error=token_exchange_failed&detail={str(exc)}"
+            url=f"{frontend_base}/workspace?github_error=token_exchange_failed&detail={exc!s}"
         )
 
     access_token = token_data.get("access_token")
@@ -167,7 +166,7 @@ async def get_github_status(
     """Get active user GitHub integration status."""
     stmt = select(GitHubAccount).where(
         GitHubAccount.user_id == "usr_default",
-        GitHubAccount.is_active == True,  # noqa: E712
+        GitHubAccount.is_active == True,
     )
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
@@ -201,7 +200,7 @@ async def get_github_repos(
     """List accessible GitHub repositories for the connected user."""
     stmt = select(GitHubAccount).where(
         GitHubAccount.user_id == "usr_default",
-        GitHubAccount.is_active == True,  # noqa: E712
+        GitHubAccount.is_active == True,
     )
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
@@ -214,7 +213,7 @@ async def get_github_repos(
         repos = await client.list_user_repos(per_page=100)
         return repos
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch repositories from GitHub: {str(exc)}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch repositories from GitHub: {exc!s}")
     finally:
         await client.close()
 
@@ -273,7 +272,7 @@ async def get_integrations_status(
     gh_res = await db.execute(
         select(GitHubAccount).where(
             GitHubAccount.user_id == "usr_default",
-            GitHubAccount.is_active == True,  # noqa: E712
+            GitHubAccount.is_active == True,
         )
     )
     gh_account = gh_res.scalar_one_or_none()
@@ -333,7 +332,7 @@ async def _upsert_state(
         )
     )
     row = res.scalar_one_or_none()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     if row is None:
         row = HarnessAuth(lane_id=lane_id, harness=harness, state=state)
