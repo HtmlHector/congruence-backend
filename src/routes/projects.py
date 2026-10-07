@@ -109,11 +109,25 @@ async def create_project(
     )
     db.add(pair_lane)
 
+    # Create Claude Code Lane
+    claude_lane_info = await runner.create_lane(host.id, "claude/progress", is_pair_lane=False)
+    claude_lane = Lane(
+        id=claude_lane_info.lane_id,
+        host_id=host.id,
+        name="Claude Code",
+        slug="claude-lane",
+        worktree_path=claude_lane_info.worktree_path,
+        branch_name="claude/progress",
+        is_pair_lane=False,
+        status="ready",
+    )
+    db.add(claude_lane)
+
     # Add default Human owner actor
     owner_actor = Actor(
         project_id=project.id,
         actor_type="human",
-        display_name="You (Owner)",
+        display_name="You",
         role="owner",
         avatar_color="#E8804A",
         presence="online",
@@ -280,3 +294,38 @@ async def store_secret(
         "injection_path": secret.injection_path,
         "status": "encrypted_and_stored",
     }
+
+@router.get("/{project_id}/lanes")
+async def get_lanes(project_id: str, db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        return []
+    res = await db.execute(select(Lane).where(Lane.host_id == host.id))
+    return [{"id": l.id, "name": l.name, "slug": l.slug, "branch_name": l.branch_name, "is_pair_lane": l.is_pair_lane, "status": l.status} for l in res.scalars().all()]
+
+@router.get("/{project_id}/actors")
+async def get_actors(project_id: str, db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
+    res = await db.execute(select(Actor).where(Actor.project_id == project_id))
+    return [{"id": a.id, "display_name": a.display_name, "actor_type": a.actor_type, "role": a.role, "presence": a.presence} for a in res.scalars().all()]
+
+@router.get("/{project_id}/git/status")
+async def get_git_status(project_id: str, lane_id: str | None = None, db: AsyncSession = Depends(get_db_session)) -> dict[str, Any]:
+    # get runner diff
+    runner = get_runner()
+    if not lane_id:
+        return {"error": "lane_id query param is required"}
+    diff_info = await runner.get_diff(lane_id)
+    return {
+        "lane_id": diff_info.lane_id,
+        "branch_name": diff_info.branch_name,
+        "files_changed": diff_info.files_changed,
+        "insertions": diff_info.insertions,
+        "deletions": diff_info.deletions,
+        "diff_text": diff_info.diff_text
+    }
+
+@router.get("")
+async def list_projects(db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
+    res = await db.execute(select(Project))
+    return [{"id": p.id, "name": p.name, "slug": p.slug, "repo_full_name": p.repo_full_name} for p in res.scalars().all()]

@@ -63,3 +63,4 @@ dmypy.json
 
 # Logs
 *.log
+congruence_dev.db

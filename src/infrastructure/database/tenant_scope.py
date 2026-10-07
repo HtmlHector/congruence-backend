@@ -33,10 +33,19 @@ async def set_rls_workspace(
     value = NO_TENANT_ID if workspace_id is None else workspace_id.strip()
     if not value:
         raise ValueError("workspace_id must not be empty")
-    await session.execute(
-        text("SELECT set_config('app.current_workspace_id', :workspace_id, true)"),
-        {"workspace_id": value},
-    )
+    bind = getattr(session, "bind", None)
+    if not bind and hasattr(session, "get_bind"):
+        try:
+            bind = session.get_bind()
+        except Exception:
+            bind = None
+    if bind and getattr(getattr(bind, "dialect", None), "name", "") == "sqlite":
+        return
+    if bind:
+        await session.execute(
+            text("SELECT set_config('app.current_workspace_id', :workspace_id, true)"),
+            {"workspace_id": value},
+        )
 
 
 async def initialize_rls(session: AsyncSession) -> None:

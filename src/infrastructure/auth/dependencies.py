@@ -139,7 +139,7 @@ async def require_workspace_member(
         LEFT JOIN identity.roles r ON r.role_id = m.role_id
         LEFT JOIN identity.users u ON u.user_id = m.user_id
         WHERE m.workspace_id = :ws_id
-          AND (u.supabase_user_id = :uid OR u.email = :email OR m.user_id::text = :uid)
+          AND (u.supabase_user_id = :uid OR u.email = :email OR CAST(m.user_id AS TEXT) = :uid)
         """
     )
     result = await db.execute(

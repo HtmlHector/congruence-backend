@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class DatabaseSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", env_prefix="DATABASE_")
+    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
     url: str = Field(
         default="postgresql+asyncpg://parabox:parabox_password@localhost:5432/parabox_dev",
@@ -38,7 +38,7 @@ class DatabaseSettings(BaseSettings):
 
 
 class RedisSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", env_prefix="REDIS_")
+    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
     url: str = Field(
         default="redis://localhost:6379/0",
@@ -47,7 +47,7 @@ class RedisSettings(BaseSettings):
 
 
 class AuthSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", env_prefix="AUTH_")
+    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
     supabase_url: str = Field(
         default="",
@@ -64,7 +64,7 @@ class AuthSettings(BaseSettings):
 
 
 class StripeSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", env_prefix="STRIPE_")
+    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
     secret_key: SecretStr = Field(
         default=SecretStr("sk_test_placeholder"),
@@ -85,7 +85,7 @@ class StripeSettings(BaseSettings):
 
 
 class LLMSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", env_prefix="LLM_")
+    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
     provider: str = Field(
         default="openrouter",
@@ -120,7 +120,7 @@ class LLMSettings(BaseSettings):
 
 
 class StorageSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", env_prefix="STORAGE_")
+    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
     endpoint: str = Field(
         default="localhost:9000",

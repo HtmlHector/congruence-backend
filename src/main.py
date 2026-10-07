@@ -19,6 +19,7 @@ from src.routes.agents import router as agents_router
 from src.routes.audit import router as audit_router
 from src.routes.auth import router as auth_router
 from src.routes.health import router as health_router
+from src.routes.integrations import router as integrations_router
 from src.routes.projects import router as projects_router
 from src.routes.proxy import router as proxy_router
 from src.routes.session_ws import router as session_ws_router
@@ -38,8 +39,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         debug=settings.debug,
     )
 
-    # Seed system roles if DB is accessible
+    # Initialize schema & seed system roles
     try:
+        from src.infrastructure.database.base import Base
+        import src.contexts.congruence.models  # noqa: F401
+        is_sqlite = str(async_engine.url).startswith("sqlite")
+        async with async_engine.begin() as conn:
+            if is_sqlite:
+                congruence_tables = [t for t in Base.metadata.sorted_tables if t.name.startswith("congruence_")]
+                await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=congruence_tables))
+            else:
+                await conn.run_sync(Base.metadata.create_all)
+
         async with AsyncSessionFactory() as session:
             roles = [
                 ("OWNER", "Full workspace control", ["*"]),
@@ -111,6 +122,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(projects_router, prefix="/api/v1")
+    app.include_router(integrations_router, prefix="/api/v1")
     app.include_router(stripe_router, prefix="/api/v1")
     app.include_router(storage_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")

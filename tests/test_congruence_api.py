@@ -18,18 +18,29 @@ async def override_get_test_db():
         yield session
 
 
-app.dependency_overrides[get_db] = override_get_test_db
-app.dependency_overrides[get_db_session] = override_get_test_db
-
-
 @pytest.fixture(autouse=True)
 async def prepare_database():
+    orig_get_db = app.dependency_overrides.get(get_db)
+    orig_get_db_session = app.dependency_overrides.get(get_db_session)
+    app.dependency_overrides[get_db] = override_get_test_db
+    app.dependency_overrides[get_db_session] = override_get_test_db
+
     congruence_tables = [t for t in Base.metadata.sorted_tables if t.name.startswith("congruence_")]
     async with test_async_engine.begin() as conn:
         await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=congruence_tables))
     yield
     async with test_async_engine.begin() as conn:
         await conn.run_sync(lambda sync_conn: Base.metadata.drop_all(sync_conn, tables=congruence_tables))
+
+    if orig_get_db is not None:
+        app.dependency_overrides[get_db] = orig_get_db
+    else:
+        app.dependency_overrides.pop(get_db, None)
+
+    if orig_get_db_session is not None:
+        app.dependency_overrides[get_db_session] = orig_get_db_session
+    else:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.mark.asyncio
