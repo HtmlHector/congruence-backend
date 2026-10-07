@@ -4,23 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.contexts.congruence.models import (
     ActivityEvent,
     Actor,
+    Grant,
     Host,
     Lane,
     Organization,
     Project,
-    VaultSecret,
+    Publication,
+    Service,
 )
 from src.infrastructure.database.session import get_db_session
 from src.infrastructure.runner.registry import get_runner
-from src.infrastructure.security.vault import get_vault_service
 
 router = APIRouter(prefix="/projects", tags=["Congruence Projects"])
 
@@ -44,12 +47,6 @@ class CreateLaneRequest(BaseModel):
 class GrantControlRequest(BaseModel):
     actor_id: str
     permission: str = Field("write", pattern="^(watch|write)$")
-
-
-class StoreSecretRequest(BaseModel):
-    key_name: str = Field(..., min_length=1, max_length=128)
-    plaintext_value: str = Field(..., min_length=1)
-    injection_path: str | None = None
 
 
 @router.post("", status_code=201)
@@ -268,33 +265,6 @@ async def create_lane(
     }
 
 
-@router.post("/{project_id}/secrets", status_code=201)
-async def store_secret(
-    project_id: str,
-    payload: StoreSecretRequest,
-    db: AsyncSession = Depends(get_db_session),
-) -> dict[str, Any]:
-    """Store an encrypted BYO credential in the project vault using AES-256-GCM."""
-    vault = get_vault_service()
-    encrypted = vault.encrypt(payload.plaintext_value)
-
-    secret = VaultSecret(
-        project_id=project_id,
-        key_name=payload.key_name,
-        encrypted_value=encrypted,
-        injection_path=payload.injection_path,
-    )
-    db.add(secret)
-    await db.commit()
-    await db.refresh(secret)
-
-    return {
-        "id": secret.id,
-        "key_name": secret.key_name,
-        "injection_path": secret.injection_path,
-        "status": "encrypted_and_stored",
-    }
-
 @router.get("/{project_id}/lanes")
 async def get_lanes(project_id: str, db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
     host_res = await db.execute(select(Host).where(Host.project_id == project_id))
@@ -432,16 +402,14 @@ async def clone_and_create_project(
     )
     db.add(claude_actor)
 
-    # Store token in vault if provided
-    if payload.auth_token:
-        vault = get_vault_service()
-        secret = await vault.encrypt_and_store(
-            session=db,
-            organization_id=org.id,
-            key_name="GITHUB_TOKEN",
-            plaintext_value=payload.auth_token,
-            project_id=project.id,
-        )
+    # NOTE: `auth_token` is deliberately ignored.
+    #
+    # This previously called `vault.encrypt_and_store(...)`, which did not exist
+    # on VaultService, so the branch could only ever have raised. It is removed
+    # rather than repaired because accepting a user-supplied token here is
+    # exactly what Host Custody forbids (`trd.md` section 7.4). Repository
+    # authorization goes through the GitHub App installation flow instead, and
+    # the App installation id is not a user credential.
 
     await db.commit()
     await db.refresh(project)
@@ -479,8 +447,19 @@ async def create_github_pull_request(
     import nanoid
     pr_number = int(nanoid.generate("123456789", size=3))
 
+    # Record publication in database
+    publication = Publication(
+        lane_id=payload.lane_id,
+        actor_id=payload.lane_id,  # Associate with lane actor context
+        pr_number=pr_number,
+        pr_url=f"https://github.com/{project.repo_full_name if project else 'org/repo'}/pull/{pr_number}",
+        status="open",
+    )
+    db.add(publication)
+
     event = ActivityEvent(
         project_id=project_id,
+        lane_id=payload.lane_id,
         action_type="github_pr_created",
         summary=f"Pull request #{pr_number} '{payload.title}' published to GitHub target branch '{payload.target_branch}'",
     )
@@ -492,7 +471,333 @@ async def create_github_pull_request(
         "title": payload.title,
         "status": "open",
         "pushed": push_success,
-        "url": f"https://github.com/org/repo/pull/{pr_number}",
+        "url": f"https://github.com/{project.repo_full_name if project else 'org/repo'}/pull/{pr_number}",
         "message": push_msg,
     }
+
+
+@router.get("/{project_id}/host")
+async def get_project_host(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Retrieve compute host state, specs, and status."""
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found for project")
+
+    runner = get_runner()
+    live_state = await runner.get_host_state(host.id)
+
+    return {
+        "id": host.id,
+        "project_id": host.project_id,
+        "state": live_state or host.state,
+        "backend_type": host.backend_type,
+        "size": host.size,
+        "disk_size_gb": host.disk_size_gb,
+        "awake_seconds_month": host.awake_seconds_month,
+        "last_wake_at": host.last_wake_at.isoformat() if host.last_wake_at else None,
+        "last_sleep_at": host.last_sleep_at.isoformat() if host.last_sleep_at else None,
+    }
+
+
+@router.post("/{project_id}/host/sleep")
+async def sleep_project_host(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Put project host to sleep, suspending compute while preserving disk."""
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found for project")
+
+    runner = get_runner()
+    await runner.sleep_host(host.id)
+
+    host.state = "asleep"
+    host.last_sleep_at = datetime.now(timezone.utc)
+
+    event = ActivityEvent(
+        project_id=project_id,
+        action_type="host_sleep",
+        summary="Host put to sleep (compute suspended, disk preserved)",
+    )
+    db.add(event)
+    await db.commit()
+
+    return {"status": "asleep", "host_id": host.id}
+
+
+@router.post("/{project_id}/host/wake")
+async def wake_project_host(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Wake project host from sleep."""
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found for project")
+
+    runner = get_runner()
+    await runner.wake_host(host.id)
+
+    host.state = "awake"
+    host.last_wake_at = datetime.now(timezone.utc)
+
+    event = ActivityEvent(
+        project_id=project_id,
+        action_type="host_wake",
+        summary="Host woken up and ready for sessions",
+    )
+    db.add(event)
+    await db.commit()
+
+    return {"status": "awake", "host_id": host.id}
+
+
+@router.get("/{project_id}/services")
+async def get_project_services(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    """Retrieve list of active services and published preview addresses for the project."""
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        return []
+
+    services_res = await db.execute(select(Service).where(Service.host_id == host.id))
+    services = services_res.scalars().all()
+
+    # Also check if runner has dev server info for lanes
+    runner = get_runner()
+    active_srvs = []
+    
+    for s in services:
+        active_srvs.append({
+            "id": s.id,
+            "lane_id": s.lane_id,
+            "port": s.port,
+            "protocol": s.protocol,
+            "address_subdomain": s.address_subdomain,
+            "access_mode": s.access_mode,
+            "is_active": s.is_active,
+            "url": f"/preview/{s.lane_id or host.id}/{s.port}/",
+        })
+
+    # If runner has in-memory dev servers registered not yet in DB, include them
+    if hasattr(runner, "_dev_server_info"):
+        for lane_id, info in runner._dev_server_info.items():
+            if info.is_running and not any(s["lane_id"] == lane_id and s["port"] == info.port for s in active_srvs):
+                active_srvs.append({
+                    "id": f"srv_{lane_id}_{info.port}",
+                    "lane_id": lane_id,
+                    "port": info.port,
+                    "protocol": "http",
+                    "address_subdomain": f"preview-{lane_id}",
+                    "access_mode": "private",
+                    "is_active": True,
+                    "url": f"/preview/{lane_id}/{info.port}/",
+                })
+
+    return active_srvs
+
+
+@router.get("/{project_id}/git/diff")
+async def get_git_diff(
+    project_id: str,
+    lane_id: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Get full git diff and stats for a worktree lane."""
+    runner = get_runner()
+    diff_info = await runner.get_diff(lane_id)
+    return {
+        "lane_id": diff_info.lane_id,
+        "branch_name": diff_info.branch_name,
+        "files_changed": diff_info.files_changed,
+        "insertions": diff_info.insertions,
+        "deletions": diff_info.deletions,
+        "diff_text": diff_info.diff_text,
+    }
+
+
+@router.get("/{project_id}/lanes/{lane_id}/grant")
+async def get_lane_grant(
+    project_id: str,
+    lane_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Get active write lease / grant for a lane."""
+    grant_res = await db.execute(
+        select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked == False).order_by(Grant.granted_at.desc())
+    )
+    grant = grant_res.scalar_one_or_none()
+    
+    if grant:
+        return {
+            "id": grant.id,
+            "lane_id": grant.lane_id,
+            "actor_id": grant.actor_id,
+            "permission": grant.permission,
+            "is_revoked": grant.is_revoked,
+            "granted_at": grant.granted_at.isoformat() if grant.granted_at else None,
+        }
+
+    # Default to owner actor
+    owner_res = await db.execute(
+        select(Actor).where(Actor.project_id == project_id, Actor.role == "owner")
+    )
+    owner = owner_res.scalar_one_or_none()
+    return {
+        "id": None,
+        "lane_id": lane_id,
+        "actor_id": owner.id if owner else "act_human",
+        "permission": "write",
+        "is_revoked": False,
+        "granted_at": None,
+    }
+
+
+@router.post("/{project_id}/lanes/{lane_id}/grant")
+async def grant_lane_control(
+    project_id: str,
+    lane_id: str,
+    payload: GrantControlRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Grant or transfer write control for a lane to an actor."""
+    # Revoke existing grants
+    existing_grants = await db.execute(
+        select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked == False)
+    )
+    for g in existing_grants.scalars().all():
+        g.is_revoked = True
+
+    # Find actor display name
+    actor_res = await db.execute(select(Actor).where(Actor.id == payload.actor_id))
+    actor = actor_res.scalar_one_or_none()
+    actor_name = actor.display_name if actor else payload.actor_id
+
+    # Create new grant
+    grant = Grant(
+        lane_id=lane_id,
+        actor_id=payload.actor_id,
+        permission=payload.permission,
+        is_revoked=False,
+    )
+    db.add(grant)
+
+    event = ActivityEvent(
+        project_id=project_id,
+        lane_id=lane_id,
+        actor_id=payload.actor_id,
+        action_type="grant_issued",
+        summary=f"Write control for lane granted to '{actor_name}'",
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(grant)
+
+    return {
+        "id": grant.id,
+        "lane_id": grant.lane_id,
+        "actor_id": grant.actor_id,
+        "permission": grant.permission,
+        "is_revoked": grant.is_revoked,
+        "granted_at": grant.granted_at.isoformat() if grant.granted_at else None,
+    }
+
+
+@router.delete("/{project_id}/lanes/{lane_id}/grant")
+async def revoke_lane_control(
+    project_id: str,
+    lane_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Revoke actor write control for a lane, restoring owner default."""
+    existing_grants = await db.execute(
+        select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked == False)
+    )
+    for g in existing_grants.scalars().all():
+        g.is_revoked = True
+
+    event = ActivityEvent(
+        project_id=project_id,
+        lane_id=lane_id,
+        action_type="grant_revoked",
+        summary="Lane write control reclaimed by owner",
+    )
+    db.add(event)
+    await db.commit()
+
+    return {"status": "revoked", "lane_id": lane_id}
+
+
+@router.get("/{project_id}/github/pull-requests")
+async def list_github_pull_requests(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    """List registered GitHub pull requests for the project."""
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        return []
+
+    lanes_res = await db.execute(select(Lane).where(Lane.host_id == host.id))
+    lane_ids = [l.id for l in lanes_res.scalars().all()]
+    if not lane_ids:
+        return []
+
+    pubs_res = await db.execute(
+        select(Publication).where(Publication.lane_id.in_(lane_ids)).order_by(Publication.created_at.desc())
+    )
+    pubs = pubs_res.scalars().all()
+
+    return [
+        {
+            "id": p.id,
+            "lane_id": p.lane_id,
+            "pr_number": p.pr_number,
+            "pr_url": p.pr_url,
+            "title": f"Pull Request #{p.pr_number}",
+            "status": p.status,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in pubs
+    ]
+
+
+@router.get("/{project_id}/activity")
+async def get_project_activity(
+    project_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    """Retrieve audit activity feed for the project."""
+    events_res = await db.execute(
+        select(ActivityEvent)
+        .where(ActivityEvent.project_id == project_id)
+        .order_by(ActivityEvent.created_at.desc())
+        .limit(limit)
+    )
+    events = events_res.scalars().all()
+
+    return [
+        {
+            "id": e.id,
+            "action_type": e.action_type,
+            "summary": e.summary,
+            "actor_id": e.actor_id,
+            "lane_id": e.lane_id,
+            "timestamp": e.created_at.isoformat() if e.created_at else None,
+        }
+        for e in events
+    ]
+
 

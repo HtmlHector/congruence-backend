@@ -1,4 +1,13 @@
-"""Agent reasoning and tool execution endpoints."""
+"""Internal tool registry endpoints.
+
+The ``/chat`` and ``/action`` endpoints that used to sit here have been removed.
+They called the LLM gateway, which spent *our* OpenAI/OpenRouter keys to run an
+agent loop for the user. That is inference resale, and it contradicted
+Harness Neutrality (``prd.md`` Invariant 3) and Host Custody (Invariant 4).
+
+These remaining endpoints only introspect and invoke locally-registered tools.
+They perform no model call and hold no credential.
+"""
 
 from __future__ import annotations
 
@@ -10,64 +19,9 @@ from pydantic import BaseModel, Field
 
 from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.jwt import UserClaims
-from src.infrastructure.llm.agent_gateway import (
-    ProviderError,
-    generate_completion,
-    request_action,
-)
 from src.infrastructure.llm.fastmcp_server import mcp as fastmcp_server
 
 router = APIRouter(prefix="/agents", tags=["agents"])
-
-
-class ChatTurnRequest(BaseModel):
-    messages: list[dict[str, Any]]
-    model: str | None = None
-    temperature: float = 0.0
-
-
-class ActionRequest(BaseModel):
-    messages: list[dict[str, Any]]
-    tools: list[dict[str, Any]] = Field(default_factory=list)
-    model: str | None = None
-
-
-@router.post("/chat")
-async def chat_turn(
-    req: ChatTurnRequest,
-    user: UserClaims = Depends(get_current_user),
-) -> dict[str, Any]:
-    """Execute a text completion turn through the LLM gateway."""
-    try:
-        content = await generate_completion(
-            messages=req.messages,
-            model=req.model,
-            temperature=req.temperature,
-        )
-        return {"content": content}
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@router.post("/action")
-async def single_turn_action(
-    req: ActionRequest,
-    user: UserClaims = Depends(get_current_user),
-) -> dict[str, Any]:
-    """Ask model for exactly one tool call given running conversation and tools."""
-    try:
-        tool_name, tool_args, tool_call_id = await request_action(
-            messages=req.messages,
-            tools=req.tools,
-            model=req.model,
-        )
-        return {
-            "tool_name": tool_name,
-            "tool_args": tool_args,
-            "tool_call_id": tool_call_id,
-        }
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/tools")

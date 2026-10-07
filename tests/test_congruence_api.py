@@ -107,15 +107,45 @@ async def test_create_agent_lane_and_store_secret():
         assert lane_data["slug"] == "codex-lane"
         assert lane_data["branch_name"] == "agent/codex-work"
 
-        # Store BYO Anthropic Key in Project Vault
-        s_resp = await client.post(
-            f"/api/v1/projects/{project_id}/secrets",
+        # Test Grant Control for Lane
+        g_resp = await client.post(
+            f"/api/v1/projects/{project_id}/lanes/{lane_data['id']}/grant",
             json={
-                "key_name": "ANTHROPIC_API_KEY",
-                "plaintext_value": "sk-ant-test-super-secret-key",
-                "injection_path": "$HOME/.claude.json",
+                "actor_id": "act_claude",
+                "permission": "write",
             },
         )
-        assert s_resp.status_code == 201
-        secret_data = s_resp.json()
-        assert secret_data["status"] == "encrypted_and_stored"
+        assert g_resp.status_code == 200
+        grant_data = g_resp.json()
+        assert grant_data["permission"] == "write"
+        assert grant_data["actor_id"] == "act_claude"
+
+        # Test Host Sleep & Wake
+        sleep_resp = await client.post(f"/api/v1/projects/{project_id}/host/sleep")
+        assert sleep_resp.status_code == 200
+        assert sleep_resp.json()["status"] == "asleep"
+
+        wake_resp = await client.post(f"/api/v1/projects/{project_id}/host/wake")
+        assert wake_resp.status_code == 200
+        assert wake_resp.json()["status"] == "awake"
+
+        # Test Services
+        srv_resp = await client.get(f"/api/v1/projects/{project_id}/services")
+        assert srv_resp.status_code == 200
+        assert isinstance(srv_resp.json(), list)
+
+        # Test Git Diff
+        diff_resp = await client.get(f"/api/v1/projects/{project_id}/git/diff?lane_id={lane_data['id']}")
+        assert diff_resp.status_code == 200
+        assert "files_changed" in diff_resp.json()
+
+        # Test Pull Requests
+        pr_resp = await client.get(f"/api/v1/projects/{project_id}/github/pull-requests")
+        assert pr_resp.status_code == 200
+        assert isinstance(pr_resp.json(), list)
+
+        # Test Activity Feed
+        act_resp = await client.get(f"/api/v1/projects/{project_id}/activity")
+        assert act_resp.status_code == 200
+        events = act_resp.json()
+        assert len(events) >= 3  # project_created, lane_created, grant_issued, etc.

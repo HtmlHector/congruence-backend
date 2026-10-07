@@ -103,24 +103,67 @@ async def session_websocket_endpoint(websocket: WebSocket, session_id: str) -> N
                     )
                 )
 
-                # Stream stdout/stderr task
+                # Stream stdout/stderr task with localhost rewrite and service detection
+                import re
+
                 async def _stream_pty(p_id: str):
                     try:
                         async for chunk in runner.read_pty_stream(p_id):
+                            # Detect and rewrite localhost:PORT links to private preview URLs
+                            rewritten = chunk
+                            # Regex matches http://localhost:PORT or http://127.0.0.1:PORT
+                            pattern = r"http://(?:localhost|127\.0\.0\.1):(\d{2,5})"
+                            ports_found = re.findall(pattern, chunk)
+                            if ports_found:
+                                for p in ports_found:
+                                    preview_target = f"/preview/{lane_id}/{p}/ [HTTPS private]"
+                                    rewritten = re.sub(
+                                        rf"http://(?:localhost|127\.0\.0\.1):{p}",
+                                        preview_target,
+                                        rewritten,
+                                    )
+                                    # Also notify session of active detected dev server
+                                    await manager.broadcast_to_session(
+                                        session_id,
+                                        {
+                                            "type": "dev_server_status",
+                                            "lane_id": lane_id,
+                                            "is_running": True,
+                                            "port": int(p),
+                                            "url": f"/preview/{lane_id}/{p}/",
+                                        },
+                                    )
+
                             await manager.broadcast_to_session(
                                 session_id,
-                                {"type": "pty_output", "pty_id": p_id, "data": chunk},
+                                {"type": "pty_output", "pty_id": p_id, "data": rewritten},
                             )
                     except Exception:
                         pass
 
                 tasks.append(asyncio.create_task(_stream_pty(pty_id)))
 
-            # 2. PTY Input Write
+            # 2. PTY Input Write (Checked against lane write grant)
             elif msg_type == "pty_input":
                 pty_id = msg.get("pty_id")
                 data = msg.get("data", "")
-                if pty_id:
+                actor_id = msg.get("actor_id", "act_human")
+                lane_id = msg.get("lane_id")
+                
+                # If a specific lane writer lease is established, ensure caller matches or is owner
+                current_writer = None
+                if lane_id and session_id in manager._lane_leases:
+                    current_writer = manager._lane_leases[session_id].get(lane_id)
+
+                if current_writer and actor_id != current_writer and actor_id != "act_human":
+                    # Drop unauthorized stdin
+                    await websocket.send_text(
+                        json.dumps({
+                            "type": "pty_input_denied",
+                            "reason": f"Lane write lease held by {current_writer}",
+                        })
+                    )
+                elif pty_id:
                     await runner.write_pty(pty_id, data)
 
             # 3. PTY Window Resize

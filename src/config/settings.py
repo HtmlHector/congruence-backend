@@ -84,41 +84,6 @@ class StripeSettings(BaseSettings):
     )
 
 
-class LLMSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
-
-    provider: str = Field(
-        default="openrouter",
-        validation_alias=AliasChoices("provider", "LLM_PROVIDER"),
-    )
-    openrouter_api_key: SecretStr = Field(
-        default=SecretStr(""),
-        validation_alias=AliasChoices("openrouter_api_key", "OPENROUTER_API_KEY"),
-    )
-    openrouter_base_url: str = Field(
-        default="https://openrouter.ai/api/v1",
-        validation_alias=AliasChoices("openrouter_base_url", "OPENROUTER_BASE_URL"),
-    )
-    openrouter_model: str = Field(
-        default="anthropic/claude-3.5-sonnet",
-        validation_alias=AliasChoices("openrouter_model", "OPENROUTER_MODEL"),
-    )
-    openrouter_vision_model: str = Field(
-        default="anthropic/claude-3.5-sonnet",
-        validation_alias=AliasChoices("openrouter_vision_model", "OPENROUTER_VISION_MODEL"),
-    )
-    openai_api_key: SecretStr = Field(
-        default=SecretStr(""),
-        validation_alias=AliasChoices("openai_api_key", "OPENAI_API_KEY"),
-    )
-    anthropic_api_key: SecretStr = Field(
-        default=SecretStr(""),
-        validation_alias=AliasChoices("anthropic_api_key", "ANTHROPIC_API_KEY"),
-    )
-    request_timeout_seconds: float = 60.0
-    enable_prompt_caching: bool = True
-
-
 class StorageSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
@@ -165,12 +130,10 @@ class Settings(BaseSettings):
     redis: RedisSettings = Field(default_factory=RedisSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     stripe: StripeSettings = Field(default_factory=StripeSettings)
-    llm: LLMSettings = Field(default_factory=LLMSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
-    vault_secret_key: str = Field(
-        default="0" * 64,
-        validation_alias=AliasChoices("vault_secret_key", "VAULT_SECRET_KEY"),
-    )
+    # `llm` (OPENAI_API_KEY / OPENROUTER_API_KEY) and `vault_secret_key` were
+    # removed under Host Custody. The control plane must not hold a
+    # model-provider key, and there is no secret store to key. See trd.md 7.4.
 
     @property
     def cors_origins_list(self) -> list[str]:

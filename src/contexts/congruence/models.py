@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -63,9 +64,6 @@ class Project(Base, TimestampMixin):
     )
     actors: Mapped[list[Actor]] = relationship(
         "Actor", back_populates="project", cascade="all, delete-orphan"
-    )
-    vault_secrets: Mapped[list[VaultSecret]] = relationship(
-        "VaultSecret", back_populates="project", cascade="all, delete-orphan"
     )
     activity_events: Mapped[list[ActivityEvent]] = relationship(
         "ActivityEvent", back_populates="project", cascade="all, delete-orphan"
@@ -159,6 +157,9 @@ class Lane(Base, TimestampMixin):
     publications: Mapped[list[Publication]] = relationship(
         "Publication", back_populates="lane", cascade="all, delete-orphan"
     )
+    harness_auth: Mapped[list[HarnessAuth]] = relationship(
+        "HarnessAuth", back_populates="lane", cascade="all, delete-orphan"
+    )
 
 
 class Grant(Base):
@@ -207,6 +208,14 @@ class Service(Base, TimestampMixin):
     access_mode: Mapped[str] = mapped_column(
         String(32), default="private", nullable=False
     )  # 'private' | 'public_timeboxed'
+    # 'app' is a normal preview/dev port. 'oauth_callback' is a short-lived,
+    # single-use surface that only exists to bridge a CLI's loopback OAuth
+    # callback; it is never listed in the preview UI and is reaped on use.
+    service_kind: Mapped[str] = mapped_column(
+        String(32), default="app", nullable=False
+    )  # 'app' | 'oauth_callback'
+    is_single_use: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -214,20 +223,46 @@ class Service(Base, TimestampMixin):
     lane: Mapped[Lane | None] = relationship("Lane", back_populates="services")
 
 
-class VaultSecret(Base, TimestampMixin):
-    __tablename__ = "congruence_vault_secrets"
+class HarnessAuth(Base, TimestampMixin):
+    """Reports whether a lane's CLI harness is authenticated.
+
+    This table holds no secret, and cannot be made to. Every column is an
+    enum, a boolean, a foreign key, or a timestamp; there is no ciphertext
+    field because the control plane has no key with which to encrypt or
+    decrypt one.
+
+    The credential itself is written by the vendor's own CLI (``claude login``)
+    into the host's ``$HOME`` on durable disk. That is why ``state`` is
+    *reported by the host* rather than known by us: we probe for the file's
+    presence and record the answer, nothing more.
+
+    See ``trd.md`` section 7 and ``prd.md`` Invariant 4 (Host Custody).
+    """
+
+    __tablename__ = "congruence_harness_auth"
 
     id: Mapped[str] = mapped_column(
-        String(64), primary_key=True, default=lambda: generate_id("sec")
+        String(64), primary_key=True, default=lambda: generate_id("hauth")
     )
-    project_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("congruence_projects.id", ondelete="CASCADE"), nullable=False, index=True
+    lane_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("congruence_lanes.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    key_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    encrypted_value: Mapped[str] = mapped_column(Text, nullable=False)
-    injection_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    harness: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 'claude' | 'codex' | 'opencode' | 'aider'
+    state: Mapped[str] = mapped_column(
+        String(32), default="disconnected", nullable=False
+    )  # 'disconnected' | 'awaiting_user' | 'connected' | 'error'
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    project: Mapped[Project] = relationship("Project", back_populates="vault_secrets")
+    lane: Mapped[Lane] = relationship("Lane", back_populates="harness_auth")
+
+    __table_args__ = (
+        UniqueConstraint("lane_id", "harness", name="uq_harness_auth_lane_harness"),
+    )
 
 
 class Publication(Base):
