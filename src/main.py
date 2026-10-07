@@ -19,6 +19,9 @@ from src.routes.agents import router as agents_router
 from src.routes.audit import router as audit_router
 from src.routes.auth import router as auth_router
 from src.routes.health import router as health_router
+from src.routes.projects import router as projects_router
+from src.routes.proxy import router as proxy_router
+from src.routes.session_ws import router as session_ws_router
 from src.routes.storage import router as storage_router
 from src.routes.workspaces import router as workspaces_router
 
@@ -107,10 +110,15 @@ def create_app() -> FastAPI:
     # API v1 routes
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(workspaces_router, prefix="/api/v1")
+    app.include_router(projects_router, prefix="/api/v1")
     app.include_router(stripe_router, prefix="/api/v1")
     app.include_router(storage_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")
     app.include_router(agents_router, prefix="/api/v1")
+
+    # Real-time WebSocket Gateway & Dev Preview Proxy
+    app.include_router(session_ws_router)
+    app.include_router(proxy_router)
 
     return app
 

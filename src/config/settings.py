@@ -167,6 +167,10 @@ class Settings(BaseSettings):
     stripe: StripeSettings = Field(default_factory=StripeSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
+    vault_secret_key: str = Field(
+        default="0" * 64,
+        validation_alias=AliasChoices("vault_secret_key", "VAULT_SECRET_KEY"),
+    )
 
     @property
     def cors_origins_list(self) -> list[str]:
@@ -174,3 +178,7 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def get_settings() -> Settings:
+    return settings

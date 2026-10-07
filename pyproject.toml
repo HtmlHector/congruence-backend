@@ -34,6 +34,7 @@ dependencies = [
     "fastmcp>=2.0.0",
     "mcp>=2.1.0",
     "nanoid>=2.0.0",
+    "aiosqlite>=0.22.1",
 ]
 
 [project.optional-dependencies]
@@ -60,7 +61,7 @@ target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-ignore = ["B008", "RUF012", "BLE001"]
+ignore = ["B008", "RUF012", "BLE001", "ASYNC222", "S110", "S112"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

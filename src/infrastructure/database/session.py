@@ -30,3 +30,6 @@ async def get_db() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+
+
+get_db_session = get_db
