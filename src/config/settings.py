@@ -136,6 +136,10 @@ class GitHubSettings(BaseSettings):
         default="traceback-test-app",
         validation_alias=AliasChoices("app_slug", "GITHUB__APP_SLUG", "GITHUB_APP_SLUG"),
     )
+    webhook_secret: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("webhook_secret", "GITHUB__WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET"),
+    )
 
 
 class Settings(BaseSettings):
