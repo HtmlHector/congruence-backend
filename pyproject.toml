@@ -6,9 +6,9 @@ build-backend = "hatchling.build"
 packages = ["src"]
 
 [project]
-name = "parabox-backend-starter"
+name = "congruence-backend"
 version = "0.1.0"
-description = "Parabox Backend Starter — Production FastAPI Service with Multi-Tenant RLS, Stripe, LLM Gateway, and Storage"
+description = "Congruence Backend — Production FastAPI Service with Multi-Tenant RLS, Stripe, LLM Gateway, and Storage"
 readme = "README.md"
 requires-python = ">=3.12"
 
