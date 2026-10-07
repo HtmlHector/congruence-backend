@@ -16,12 +16,14 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.contexts.congruence.models import HarnessAuth, Lane, Project
+from src.config.settings import settings
+from src.contexts.congruence.models import HarnessAuth, Host, Lane, Project, GitHubAccount
 from src.infrastructure.auth.harness_login import (
     SUPPORTED_HARNESSES,
     HarnessLoginError,
@@ -30,6 +32,8 @@ from src.infrastructure.auth.harness_login import (
     registry,
 )
 from src.infrastructure.database.session import get_db_session
+from src.infrastructure.github.client import GitHubClient, GitHubClientError
+from src.infrastructure.github.oauth import GitHubOAuth, GitHubOAuthError
 
 router = APIRouter(prefix="/integrations", tags=["Integrations & OAuth"])
 
@@ -45,16 +49,194 @@ class StartLoginRequest(BaseModel):
     harness: str = Field(..., pattern="^(claude|codex)$")
 
 
+@router.get("/github/connect")
+async def github_connect() -> dict[str, str]:
+    """Generate GitHub OAuth 2.0 authorization URL."""
+    oauth = GitHubOAuth()
+    auth_url = oauth.get_authorize_url()
+    return {
+        "provider": "github",
+        "authorize_url": auth_url,
+        "client_id": settings.github.client_id,
+        "app_slug": settings.github.app_slug,
+    }
+
+
+@router.get("/github/callback")
+async def github_oauth_callback(
+    code: str | None = Query(None),
+    state: str | None = Query(None),
+    error: str | None = Query(None),
+    error_description: str | None = Query(None),
+    db: AsyncSession = Depends(get_db_session),
+) -> RedirectResponse:
+    """Handle GitHub OAuth authorization code callback."""
+    frontend_base = settings.cors_origins.split(",")[0].rstrip("/")
+    if not frontend_base:
+        frontend_base = "http://localhost:3000"
+
+    if error:
+        return RedirectResponse(
+            url=f"{frontend_base}/workspace?github_error={error}&error_description={error_description or ''}"
+        )
+
+    if not code:
+        return RedirectResponse(
+            url=f"{frontend_base}/workspace?github_error=missing_code"
+        )
+
+    oauth = GitHubOAuth()
+    try:
+        token_data = await oauth.exchange_code(code)
+    except Exception as exc:
+        return RedirectResponse(
+            url=f"{frontend_base}/workspace?github_error=token_exchange_failed&detail={str(exc)}"
+        )
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        return RedirectResponse(
+            url=f"{frontend_base}/workspace?github_error=no_access_token"
+        )
+
+    token_type = token_data.get("token_type", "bearer")
+    scope = token_data.get("scope", "")
+
+    # Fetch user info from GitHub
+    client = GitHubClient(access_token)
+    try:
+        user_info = await client.get_user()
+    except Exception:
+        user_info = {}
+    finally:
+        await client.close()
+
+    github_user_id = str(user_info.get("id")) if user_info.get("id") else None
+    username = user_info.get("login")
+    avatar_url = user_info.get("avatar_url")
+
+    # Upsert default user GitHub account
+    user_id = "usr_default"
+    stmt = select(GitHubAccount).where(GitHubAccount.user_id == user_id)
+    res = await db.execute(stmt)
+    account = res.scalar_one_or_none()
+
+    if account:
+        account.access_token = access_token
+        account.token_type = token_type
+        account.scope = scope
+        account.github_user_id = github_user_id
+        account.username = username
+        account.avatar_url = avatar_url
+        account.is_active = True
+    else:
+        account = GitHubAccount(
+            user_id=user_id,
+            access_token=access_token,
+            token_type=token_type,
+            scope=scope,
+            github_user_id=github_user_id,
+            username=username,
+            avatar_url=avatar_url,
+            is_active=True,
+        )
+        db.add(account)
+
+    await db.commit()
+
+    return RedirectResponse(
+        url=f"{frontend_base}/workspace?github=connected&user={username or ''}"
+    )
+
+
+@router.get("/github/status")
+async def get_github_status(
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Get active user GitHub integration status."""
+    stmt = select(GitHubAccount).where(
+        GitHubAccount.user_id == "usr_default",
+        GitHubAccount.is_active == True,  # noqa: E712
+    )
+    res = await db.execute(stmt)
+    account = res.scalar_one_or_none()
+
+    if not account or not account.access_token:
+        return {
+            "connected": False,
+            "username": None,
+            "avatar_url": None,
+            "github_user_id": None,
+            "scope": None,
+            "app_slug": settings.github.app_slug,
+            "app_id": settings.github.app_id,
+        }
+
+    return {
+        "connected": True,
+        "username": account.username,
+        "avatar_url": account.avatar_url,
+        "github_user_id": account.github_user_id,
+        "scope": account.scope,
+        "app_slug": settings.github.app_slug,
+        "app_id": settings.github.app_id,
+    }
+
+
+@router.get("/github/repos")
+async def get_github_repos(
+    db: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    """List accessible GitHub repositories for the connected user."""
+    stmt = select(GitHubAccount).where(
+        GitHubAccount.user_id == "usr_default",
+        GitHubAccount.is_active == True,  # noqa: E712
+    )
+    res = await db.execute(stmt)
+    account = res.scalar_one_or_none()
+
+    if not account or not account.access_token:
+        raise HTTPException(status_code=401, detail="GitHub not connected. Please authorize GitHub first.")
+
+    client = GitHubClient(account.access_token)
+    try:
+        repos = await client.list_user_repos(per_page=100)
+        return repos
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch repositories from GitHub: {str(exc)}")
+    finally:
+        await client.close()
+
+
+@router.delete("/github/disconnect")
+async def disconnect_github(
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Disconnect GitHub and deactivate stored access token."""
+    stmt = select(GitHubAccount).where(GitHubAccount.user_id == "usr_default")
+    res = await db.execute(stmt)
+    account = res.scalar_one_or_none()
+
+    if account:
+        if account.access_token:
+            oauth = GitHubOAuth()
+            try:
+                await oauth.revoke_token(account.access_token)
+            except Exception:
+                pass
+        account.is_active = False
+        account.access_token = ""
+        await db.commit()
+
+    return {"connected": False, "disconnected": True}
+
+
 @router.get("/status/{project_id}")
 async def get_integrations_status(
     project_id: str,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Report connected integrations for the project.
-
-    Agent rows are host-observed booleans, never tokens. GitHub reflects the
-    App installation, which is an installation id and not a user credential.
-    """
+    """Report connected integrations for the project."""
     project_res = await db.execute(select(Project).where(Project.id == project_id))
     project = project_res.scalar_one_or_none()
     if not project:
@@ -72,20 +254,27 @@ async def get_integrations_status(
         )
         for row in auth_res.scalars().all():
             current = harness_states.get(row.harness, "disconnected")
-            # Prefer the strongest state seen across lanes: a harness
-            # authenticated in any lane of the project is usable.
             rank = {"disconnected": 0, "error": 1, "awaiting_user": 2, "connected": 3}
             if rank.get(row.state, 0) >= rank.get(current, 0):
                 harness_states[row.harness] = row.state
 
-    github_app_id = os.getenv("GITHUB__APP_ID") or os.getenv("GITHUB_APP_ID", "4010628")
+    # Check user github connection
+    gh_res = await db.execute(
+        select(GitHubAccount).where(
+            GitHubAccount.user_id == "usr_default",
+            GitHubAccount.is_active == True,  # noqa: E712
+        )
+    )
+    gh_account = gh_res.scalar_one_or_none()
 
     return {
         "project_id": project_id,
         "github": {
-            "connected": bool(project.repo_full_name),
-            "app_id": github_app_id,
-            "install_url": "https://github.com/apps/congruence-app/installations/new",
+            "connected": bool(project.repo_full_name) or (gh_account is not None),
+            "username": gh_account.username if gh_account else None,
+            "app_id": settings.github.app_id,
+            "app_slug": settings.github.app_slug,
+            "install_url": f"https://github.com/apps/{settings.github.app_slug}/installations/new",
             "repo": project.repo_full_name,
         },
         "harnesses": {
@@ -103,11 +292,11 @@ async def get_integrations_status(
 @router.get("/github/install-url")
 async def get_github_install_url() -> dict[str, str]:
     """Return public GitHub App installation URL for repository authorization."""
-    app_slug = os.getenv("GITHUB__APP_SLUG") or os.getenv("GITHUB_APP_SLUG", "congruence-dev-app")
     return {
-        "install_url": f"https://github.com/apps/{app_slug}/installations/new",
-        "app_slug": app_slug,
+        "install_url": f"https://github.com/apps/{settings.github.app_slug}/installations/new",
+        "app_slug": settings.github.app_slug,
     }
+
 
 
 async def _get_lane_or_404(db: AsyncSession, lane_id: str) -> Lane:

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.contexts.congruence.models import (
     ActivityEvent,
     Actor,
+    GitHubAccount,
     Grant,
     Host,
     Lane,
@@ -350,8 +351,21 @@ async def clone_and_create_project(
     await db.flush()
 
     # Clone the actual remote repository
+    auth_token = payload.auth_token
+    if not auth_token:
+        gh_res = await db.execute(
+            select(GitHubAccount).where(
+                GitHubAccount.user_id == "usr_default",
+                GitHubAccount.is_active == True,  # noqa: E712
+            )
+        )
+        gh_acc = gh_res.scalar_one_or_none()
+        if gh_acc:
+            auth_token = gh_acc.access_token
+
     if hasattr(runner, "clone_repository"):
-        await runner.clone_repository(host.id, payload.repo_url, payload.auth_token)
+        await runner.clone_repository(host.id, payload.repo_url, auth_token)
+
 
     # Provision Pair Lane
     lane_info = await runner.create_lane(host.id, project.default_branch, is_pair_lane=True)

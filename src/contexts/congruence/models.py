@@ -290,6 +290,22 @@ class Publication(Base):
     lane: Mapped[Lane] = relationship("Lane", back_populates="publications")
 
 
+class GitHubAccount(Base, TimestampMixin):
+    __tablename__ = "congruence_github_accounts"
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=lambda: generate_id("gh")
+    )
+    user_id: Mapped[str] = mapped_column(String(64), default="usr_default", nullable=False, index=True)
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    token_type: Mapped[str] = mapped_column(String(32), default="bearer", nullable=False)
+    scope: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    github_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 class ActivityEvent(Base):
     __tablename__ = "congruence_activity_events"
 
@@ -308,3 +324,4 @@ class ActivityEvent(Base):
     )
 
     project: Mapped[Project] = relationship("Project", back_populates="activity_events")
+

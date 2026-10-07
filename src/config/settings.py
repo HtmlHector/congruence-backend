@@ -113,6 +113,31 @@ class StorageSettings(BaseSettings):
     )
 
 
+class GitHubSettings(BaseSettings):
+    model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
+
+    client_id: str = Field(
+        default="Iv23liLlDLL3OqUvCbgq",
+        validation_alias=AliasChoices("client_id", "GITHUB__CLIENT_ID", "GITHUB_CLIENT_ID"),
+    )
+    client_secret: SecretStr = Field(
+        default=SecretStr("9c2008bc1c8217c9ffc33953b6019e7b14d0649d"),
+        validation_alias=AliasChoices("client_secret", "GITHUB__CLIENT_SECRET", "GITHUB_CLIENT_SECRET"),
+    )
+    redirect_uri: str = Field(
+        default="http://localhost:8000/api/v1/integrations/github/callback",
+        validation_alias=AliasChoices("redirect_uri", "GITHUB__REDIRECT_URI", "GITHUB_REDIRECT_URI"),
+    )
+    app_id: str = Field(
+        default="4010628",
+        validation_alias=AliasChoices("app_id", "GITHUB__APP_ID", "GITHUB_APP_ID"),
+    )
+    app_slug: str = Field(
+        default="traceback-test-app",
+        validation_alias=AliasChoices("app_slug", "GITHUB__APP_SLUG", "GITHUB_APP_SLUG"),
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", env_file=".env", env_file_encoding="utf-8")
 
@@ -131,6 +156,8 @@ class Settings(BaseSettings):
     auth: AuthSettings = Field(default_factory=AuthSettings)
     stripe: StripeSettings = Field(default_factory=StripeSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
+    github: GitHubSettings = Field(default_factory=GitHubSettings)
+
     # `llm` (OPENAI_API_KEY / OPENROUTER_API_KEY) and `vault_secret_key` were
     # removed under Host Custody. The control plane must not hold a
     # model-provider key, and there is no secret store to key. See trd.md 7.4.

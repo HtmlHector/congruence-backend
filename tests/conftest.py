@@ -13,6 +13,17 @@ from src.infrastructure.database.session import get_db
 from src.main import app
 
 
+class MockScalars:
+    def __init__(self, rows=None):
+        self._rows = rows or []
+
+    def all(self):
+        return self._rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+
 class MockResult:
     def __init__(self, rows=None):
         self._rows = rows or []
@@ -26,14 +37,38 @@ class MockResult:
     def scalar(self):
         return self._rows[0][0] if self._rows and self._rows[0] else None
 
+    def scalar_one_or_none(self):
+        if not self._rows:
+            return None
+        row = self._rows[0]
+        if isinstance(row, tuple) or isinstance(row, list):
+            return row[0] if row else None
+        return row
+
+    def scalars(self):
+        items = []
+        for r in self._rows:
+            if isinstance(r, tuple) or isinstance(r, list):
+                items.append(r[0] if r else None)
+            else:
+                items.append(r)
+        return MockScalars(items)
+
+
 
 class MockAsyncSession:
     def __init__(self):
         self.commit = AsyncMock()
         self.rollback = AsyncMock()
+        self.flush = AsyncMock()
+
+    def add(self, instance):
+        pass
 
     async def execute(self, statement, params=None):
         stmt_str = str(statement)
+        if "congruence_github_accounts" in stmt_str:
+            return MockResult([])
         if "subscription.subscriptions" in stmt_str:
             return MockResult([("sub_test_123", "PRO", "active", None, None)])
         if "workspace.memberships" in stmt_str and "SELECT r.name, r.permissions" in stmt_str:
@@ -51,7 +86,8 @@ class MockAsyncSession:
                     )
                 ]
             )
-        return MockResult([("1",)])
+        return MockResult([])
+
 
     async def begin_nested(self):
         class Nested:
