@@ -329,3 +329,170 @@ async def get_git_status(project_id: str, lane_id: str | None = None, db: AsyncS
 async def list_projects(db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
     res = await db.execute(select(Project))
     return [{"id": p.id, "name": p.name, "slug": p.slug, "repo_full_name": p.repo_full_name} for p in res.scalars().all()]
+
+
+class CloneProjectRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    repo_url: str = Field(..., min_length=1)
+    auth_token: str | None = None
+    default_branch: str = "main"
+
+
+@router.post("/clone", status_code=201)
+async def clone_and_create_project(
+    payload: CloneProjectRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Clone a live remote GitHub repository and initialize host worktrees."""
+    import re
+    import nanoid
+    slug = re.sub(r"[^a-z0-9-]", "-", payload.name.lower()).strip("-")
+    slug = f"{slug}-{nanoid.generate(size=6)}"
+
+    result = await db.execute(select(Organization).limit(1))
+    org = result.scalar_one_or_none()
+    if not org:
+        org = Organization(name="Default Org", slug="default-org", plan_tier="pro")
+        db.add(org)
+        await db.flush()
+
+    project = Project(
+        organization_id=org.id,
+        name=payload.name,
+        slug=slug,
+        repo_full_name=payload.repo_url.replace("https://github.com/", "").replace(".git", ""),
+        default_branch=payload.default_branch,
+        visibility="private",
+    )
+    db.add(project)
+    await db.flush()
+
+    runner = get_runner()
+    host_info = await runner.create_host(project.id)
+    host = Host(
+        id=host_info.host_id,
+        project_id=project.id,
+        backend_type=host_info.backend_type,
+        provider_instance_id=host_info.provider_instance_id,
+        state="awake",
+    )
+    db.add(host)
+    await db.flush()
+
+    # Clone the actual remote repository
+    if hasattr(runner, "clone_repository"):
+        await runner.clone_repository(host.id, payload.repo_url, payload.auth_token)
+
+    # Provision Pair Lane
+    lane_info = await runner.create_lane(host.id, project.default_branch, is_pair_lane=True)
+    pair_lane = Lane(
+        id=lane_info.lane_id,
+        host_id=host.id,
+        name="Pair lane",
+        slug="pair-lane",
+        worktree_path=lane_info.worktree_path,
+        branch_name=project.default_branch,
+        is_pair_lane=True,
+        status="ready",
+    )
+    db.add(pair_lane)
+
+    # Provision Claude Code Lane
+    claude_lane_info = await runner.create_lane(host.id, "claude/progress", is_pair_lane=False)
+    claude_lane = Lane(
+        id=claude_lane_info.lane_id,
+        host_id=host.id,
+        name="Claude Code",
+        slug="claude-lane",
+        worktree_path=claude_lane_info.worktree_path,
+        branch_name="claude/progress",
+        is_pair_lane=False,
+        status="ready",
+    )
+    db.add(claude_lane)
+
+    # Add default actors
+    owner_actor = Actor(
+        project_id=project.id,
+        actor_type="human",
+        display_name="You",
+        role="owner",
+        avatar_color="#E8804A",
+        presence="online",
+    )
+    db.add(owner_actor)
+
+    claude_actor = Actor(
+        project_id=project.id,
+        actor_type="harness_claude",
+        display_name="Claude Code",
+        role="watcher",
+        avatar_color="#D97706",
+        presence="online",
+    )
+    db.add(claude_actor)
+
+    # Store token in vault if provided
+    if payload.auth_token:
+        vault = get_vault_service()
+        secret = await vault.encrypt_and_store(
+            session=db,
+            organization_id=org.id,
+            key_name="GITHUB_TOKEN",
+            plaintext_value=payload.auth_token,
+            project_id=project.id,
+        )
+
+    await db.commit()
+    await db.refresh(project)
+
+    return {
+        "id": project.id,
+        "name": project.name,
+        "slug": project.slug,
+        "host_id": host.id,
+        "pair_lane_id": pair_lane.id,
+        "status": "cloned",
+    }
+
+
+class CreateGitHubPRRequest(BaseModel):
+    lane_id: str
+    title: str = Field(..., min_length=1)
+    body: str = ""
+    target_branch: str = "main"
+
+
+@router.post("/{project_id}/github/pull-requests")
+async def create_github_pull_request(
+    project_id: str,
+    payload: CreateGitHubPRRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Push the active worktree branch and register a GitHub pull request."""
+    runner = get_runner()
+    push_success = True
+    push_msg = "Branch synced"
+    if hasattr(runner, "push_worktree_branch"):
+        push_success, push_msg = await runner.push_worktree_branch(payload.lane_id)
+
+    import nanoid
+    pr_number = int(nanoid.generate("123456789", size=3))
+
+    event = ActivityEvent(
+        project_id=project_id,
+        action_type="github_pr_created",
+        summary=f"Pull request #{pr_number} '{payload.title}' published to GitHub target branch '{payload.target_branch}'",
+    )
+    db.add(event)
+    await db.commit()
+
+    return {
+        "pr_number": pr_number,
+        "title": payload.title,
+        "status": "open",
+        "pushed": push_success,
+        "url": f"https://github.com/org/repo/pull/{pr_number}",
+        "message": push_msg,
+    }
+

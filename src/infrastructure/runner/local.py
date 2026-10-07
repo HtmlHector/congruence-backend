@@ -129,6 +129,46 @@ class LocalProcessRunner(HostBackend):
         self._lanes[lane_id] = info
         return info
 
+    async def clone_repository(
+        self, host_id: str, repo_url: str, token: str | None = None
+    ) -> bool:
+        """Clone a remote Git repository into the host's base repo directory."""
+        import shutil
+        host_dir = os.path.join(self.base_workdir, host_id)
+        repo_dir = os.path.join(host_dir, "repo")
+        os.makedirs(host_dir, exist_ok=True)
+        if os.path.exists(repo_dir):
+            shutil.rmtree(repo_dir, ignore_errors=True)
+
+        target_url = repo_url
+        if token and "github.com" in repo_url:
+            clean_url = repo_url.replace("https://", "").replace("http://", "")
+            target_url = f"https://x-access-token:{token}@{clean_url}"
+
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", target_url, repo_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, _ = await proc.communicate()
+        return proc.returncode == 0
+
+    async def push_worktree_branch(
+        self, lane_id: str, remote_name: str = "origin"
+    ) -> tuple[bool, str]:
+        """Push the lane's worktree branch to the upstream remote."""
+        lane = self._lanes.get(lane_id)
+        if not lane:
+            return False, "Lane not found"
+        proc = await asyncio.create_subprocess_exec(
+            "git", "push", "-u", remote_name, lane.branch_name,
+            cwd=lane.worktree_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        return proc.returncode == 0, (out or err).decode("utf-8", errors="replace")
+
     async def spawn_pty(
         self,
         lane_id: str,
