@@ -49,6 +49,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 congruence_tables = [t for t in Base.metadata.sorted_tables if t.name.startswith("congruence_")]
                 await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=congruence_tables))
             else:
+                for schema in ["identity", "workspace", "subscription", "audit"]:
+                    await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
                 await conn.run_sync(Base.metadata.create_all)
 
         if not is_sqlite:

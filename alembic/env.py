@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 import src.contexts.audit.models
 import src.contexts.billing.models
+import src.contexts.congruence.models  # noqa: F401
 
 # Import all models to ensure metadata registration
 import src.contexts.identity.models
@@ -43,10 +44,14 @@ def do_run_migrations(connection) -> None:
 
 
 async def run_migrations_online() -> None:
+    connect_args = {}
+    if not settings.database.url.startswith("sqlite"):
+        connect_args["statement_cache_size"] = 0
+
     connectable = create_async_engine(
         settings.database.url,
         poolclass=pool.NullPool,
-        connect_args={"statement_cache_size": 0},
+        connect_args=connect_args,
     )
 
     async with connectable.connect() as connection:

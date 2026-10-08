@@ -1,4 +1,4 @@
-.PHONY: help install dev test lint migrate up down
+.PHONY: help install dev test lint migrate init-db seed-db up down
 
 help:
 	@echo "Available commands:"
@@ -7,6 +7,8 @@ help:
 	@echo "  make test     - Run pytest suite"
 	@echo "  make lint     - Run ruff linter and formatter check"
 	@echo "  make migrate  - Run alembic database migrations"
+	@echo "  make init-db  - Initialize database schema"
+	@echo "  make seed-db  - Initialize and seed sample development data"
 	@echo "  make up       - Start Postgres and Redis via Docker Compose"
 	@echo "  make down     - Stop Docker Compose services"
 
@@ -24,6 +26,12 @@ lint:
 
 migrate:
 	uv run alembic upgrade head
+
+init-db:
+	uv run python scripts/init_db.py
+
+seed-db:
+	uv run python scripts/init_db.py --seed
 
 up:
 	docker compose up -d

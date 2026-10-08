@@ -28,7 +28,7 @@ depends_on = None
 
 def upgrade() -> None:
     # 1. Drop the credential store. Irreversible; see module docstring.
-    op.drop_table("congruence_vault_secrets")
+    op.execute("DROP TABLE IF EXISTS congruence_vault_secrets")
 
     # 2. Mark callback-bridging services so they can be forced single-use and
     #    kept out of the preview UI.
