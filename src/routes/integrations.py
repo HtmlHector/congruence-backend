@@ -59,6 +59,78 @@ class StartLoginRequest(BaseModel):
     harness: str = Field(..., pattern="^(claude|codex)$")
 
 
+class ConnectPATRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+
+
+@router.post("/github/connect-pat")
+async def connect_github_pat(
+    payload: ConnectPATRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Connect GitHub account using a Personal Access Token (PAT)."""
+    raw_token = payload.token.strip()
+    if not raw_token:
+        raise HTTPException(status_code=400, detail="Personal access token is required")
+
+    client = GitHubClient(raw_token)
+    try:
+        user_info = await client.get_user()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid GitHub Personal Access Token or network error: {exc!s}",
+        )
+    finally:
+        await client.close()
+
+    if not user_info or not user_info.get("login"):
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to retrieve GitHub profile with provided token.",
+        )
+
+    github_user_id = str(user_info.get("id")) if user_info.get("id") else None
+    username = user_info.get("login")
+    avatar_url = user_info.get("avatar_url")
+
+    # Upsert default user GitHub account
+    user_id = "usr_default"
+    stmt = select(GitHubAccount).where(GitHubAccount.user_id == user_id)
+    res = await db.execute(stmt)
+    account = res.scalar_one_or_none()
+
+    if account:
+        account.access_token = raw_token
+        account.token_type = "bearer"
+        account.scope = "repo,user"
+        account.github_user_id = github_user_id
+        account.username = username
+        account.avatar_url = avatar_url
+        account.is_active = True
+    else:
+        account = GitHubAccount(
+            user_id=user_id,
+            access_token=raw_token,
+            token_type="bearer",
+            scope="repo,user",
+            github_user_id=github_user_id,
+            username=username,
+            avatar_url=avatar_url,
+            is_active=True,
+        )
+        db.add(account)
+
+    await db.commit()
+
+    return {
+        "connected": True,
+        "username": username,
+        "avatar_url": avatar_url,
+        "github_user_id": github_user_id,
+    }
+
+
 @router.get("/github/connect")
 async def github_connect() -> dict[str, str]:
     """Generate GitHub OAuth 2.0 authorization URL."""
