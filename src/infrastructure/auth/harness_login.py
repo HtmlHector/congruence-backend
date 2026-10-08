@@ -14,6 +14,11 @@ through the existing private-service-address machinery as a single-use,
 short-lived URL. The user's browser then talks to the *vendor*; only the
 vendor's redirect comes back to us, and the CLI itself performs the code
 exchange and writes the token to ``$HOME``.
+
+Antigravity (``agy``) needs no bridge: it uses a remote SSH OAuth flow in which
+the CLI prints a one-time authorization URL on the session terminal and the
+user pastes the browser's code back into the same PTY. The URL passes through
+the PTY stream to the client unmodified; no loopback port is ever bound.
 """
 
 from __future__ import annotations
@@ -25,6 +30,10 @@ from datetime import UTC, datetime, timedelta
 # Loopback ports the supported CLIs bind their OAuth callbacks to. Kept as an
 # explicit allowlist so a compromised or unexpected process on the host cannot
 # get a public service URL just by listening.
+#
+# Antigravity is deliberately absent: its remote OAuth flow prints an
+# authorization URL on the PTY and takes the code back as terminal input, so
+# the CLI never binds a loopback callback port.
 CALLBACK_PORTS: dict[str, int] = {
     "claude": 1455,
     "codex": 1455,
@@ -33,14 +42,39 @@ CALLBACK_PORTS: dict[str, int] = {
 LOGIN_COMMANDS: dict[str, list[str]] = {
     "claude": ["claude", "login"],
     "codex": ["codex", "login"],
+    # Antigravity has no headless login subcommand: sign-in happens by
+    # launching the TUI (``agy``), which over a remote session prints a
+    # one-time authorization URL and waits for the user to paste the browser
+    # code back into the PTY.
+    "antigravity": ["agy"],
 }
 
 SUPPORTED_HARNESSES = tuple(LOGIN_COMMANDS)
+
+# How each harness surfaces its sign-in step to the browser.
+# * ``loopback_bridge`` — the CLI binds a loopback callback port that we
+#   publish as a private service URL (see CALLBACK_PORTS).
+# * ``url_paste`` — the CLI prints a one-time authorization URL on the PTY and
+#   the user pastes the browser's code back into the session terminal.
+LOGIN_FLOWS: dict[str, str] = {
+    "claude": "loopback_bridge",
+    "codex": "loopback_bridge",
+    "antigravity": "url_paste",
+}
+
+
+def login_flow(harness: str) -> str:
+    """Return how the browser participates in this harness's sign-in."""
+    return LOGIN_FLOWS.get(harness, "loopback_bridge")
 
 # Credential presence on the host. We check existence only, never contents.
 CREDENTIAL_PATHS: dict[str, str] = {
     "claude": "~/.claude/.credentials.json",
     "codex": "~/.codex/auth.json",
+    # Antigravity stores its token in the host OS keyring, not in a file, so
+    # there is no credential path to read or delete. The CLI home directory is
+    # the presence marker the host can check instead.
+    "antigravity": "~/.gemini/antigravity-cli/",
 }
 
 # Where the CLI prints its authorize URL. Matched only so we can surface a

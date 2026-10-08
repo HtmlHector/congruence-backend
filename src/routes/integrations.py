@@ -40,6 +40,7 @@ from src.infrastructure.auth.harness_login import (
     HarnessLoginError,
     build_login_command,
     credential_path,
+    login_flow,
     registry,
 )
 from src.infrastructure.auth.jwt import UserClaims
@@ -53,13 +54,14 @@ router = APIRouter(prefix="/integrations", tags=["Integrations & OAuth"])
 HARNESS_LABELS = {
     "claude": "Claude Code",
     "codex": "Codex",
+    "antigravity": "Antigravity",
     "opencode": "OpenCode",
     "aider": "Aider",
 }
 
 
 class StartLoginRequest(BaseModel):
-    harness: str = Field(..., pattern="^(claude|codex)$")
+    harness: str = Field(..., pattern="^(claude|codex|antigravity)$")
 
 
 class ConnectPATRequest(BaseModel):
@@ -383,6 +385,7 @@ async def get_integrations_status(
                 "state": harness_states.get(name, "disconnected"),
                 "credential_path": credential_path(name),
                 "supports_login": name in SUPPORTED_HARNESSES,
+                "flow": login_flow(name) if name in SUPPORTED_HARNESSES else None,
             }
             for name in HARNESS_LABELS
         },
@@ -459,6 +462,20 @@ async def start_harness_login(
     except HarnessLoginError as exc:
         raise HTTPException(status_code=400, detail=exc.message) from exc
 
+    flow = login_flow(harness)
+    if flow == "url_paste":
+        note = (
+            "Runs the vendor's own sign-in on the host. The CLI prints a one-time "
+            "authorization URL in the session terminal; open it on any device and "
+            "paste the code back into the session. Congruence never receives "
+            "the credential; the CLI writes it to the host's OS keyring."
+        )
+    else:
+        note = (
+            "Runs the vendor's own login on the host. Congruence never receives "
+            "the credential; the CLI writes it to the host's $HOME."
+        )
+
     session = registry.start(lane_id, harness)
     await _upsert_state(db, lane_id, harness, "awaiting_user")
     await db.commit()
@@ -468,13 +485,11 @@ async def start_harness_login(
         "harness": harness,
         "label": HARNESS_LABELS.get(harness, harness),
         "state": session.state,
+        "flow": flow,
         # The command is executed on the host. We relay it, we do not run it.
         "host_command": command,
         "credential_path": credential_path(harness),
-        "note": (
-            "Runs the vendor's own login on the host. Congruence never receives "
-            "the credential; the CLI writes it to the host's $HOME."
-        ),
+        "note": note,
     }
 
 
