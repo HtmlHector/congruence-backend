@@ -43,6 +43,25 @@ class Organization(Base, TimestampMixin):
     )
 
 
+class OrganizationMember(Base, TimestampMixin):
+    """Links an authenticated user to an organization. Projects are visible only to members of their org."""
+
+    __tablename__ = "congruence_organization_members"
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=lambda: generate_id("orgm")
+    )
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("congruence_organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(32), default="owner", nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "user_id", name="uq_org_member"),
+    )
+
+
 class Project(Base, TimestampMixin):
     __tablename__ = "congruence_projects"
 

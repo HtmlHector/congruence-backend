@@ -6,7 +6,7 @@ from typing import Any
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,14 +19,60 @@ from src.contexts.congruence.models import (
     Host,
     Lane,
     Organization,
+    OrganizationMember,
     Project,
     Publication,
     Service,
+    generate_id,
 )
+from src.infrastructure.auth.dependencies import get_current_user
+from src.infrastructure.auth.jwt import UserClaims
 from src.infrastructure.database.session import get_db_session
 from src.infrastructure.runner.registry import get_runner
 
-router = APIRouter(prefix="/projects", tags=["Congruence Projects"])
+
+async def _ensure_user_org(db: AsyncSession, user_id: str) -> Organization:
+    """Return the user's organization, creating a personal one on first use."""
+    res = await db.execute(
+        select(Organization)
+        .join(OrganizationMember, OrganizationMember.organization_id == Organization.id)
+        .where(OrganizationMember.user_id == user_id)
+        .limit(1)
+    )
+    org = res.scalars().first()
+    if org:
+        return org
+    org = Organization(name="Personal", slug=generate_id("org").lower(), plan_tier="free")
+    db.add(org)
+    await db.flush()
+    db.add(OrganizationMember(organization_id=org.id, user_id=user_id, role="owner"))
+    await db.flush()
+    return org
+
+
+async def scope_project_access(
+    request: Request,
+    user: UserClaims = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> None:
+    """Authenticate every project route. Routes with a project_id require org membership, else 404."""
+    project_id = request.path_params.get("project_id")
+    if project_id is None:
+        return
+    res = await db.execute(
+        select(Project.id)
+        .join(OrganizationMember, OrganizationMember.organization_id == Project.organization_id)
+        .where(Project.id == project_id, OrganizationMember.user_id == user.user_id)
+    )
+    if res.first() is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
+router = APIRouter(
+    prefix="/projects",
+    tags=["Congruence Projects"],
+    dependencies=[Depends(scope_project_access)],
+)
 
 
 # Schemas
@@ -53,16 +99,11 @@ class GrantControlRequest(BaseModel):
 @router.post("", status_code=201)
 async def create_project(
     payload: CreateProjectRequest,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Create a new Congruence collaborative project with auto-provisioned Host and Pair lane."""
-    # Ensure default organization exists
-    result = await db.execute(select(Organization).limit(1))
-    org = result.scalar_one_or_none()
-    if not org:
-        org = Organization(name="Default Org", slug="default-org", plan_tier="pro")
-        db.add(org)
-        await db.flush()
+    org = await _ensure_user_org(db, user.user_id)
 
     # Check slug uniqueness
     existing = await db.execute(select(Project).where(Project.slug == payload.slug))
@@ -297,8 +338,15 @@ async def get_git_status(project_id: str, lane_id: str | None = None, db: AsyncS
     }
 
 @router.get("")
-async def list_projects(db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
-    res = await db.execute(select(Project))
+async def list_projects(
+    user: UserClaims = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    res = await db.execute(
+        select(Project)
+        .join(OrganizationMember, OrganizationMember.organization_id == Project.organization_id)
+        .where(OrganizationMember.user_id == user.user_id)
+    )
     return [{"id": p.id, "name": p.name, "slug": p.slug, "repo_full_name": p.repo_full_name} for p in res.scalars().all()]
 
 
@@ -312,6 +360,7 @@ class CloneProjectRequest(BaseModel):
 @router.post("/clone", status_code=201)
 async def clone_and_create_project(
     payload: CloneProjectRequest,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Clone a live remote GitHub repository and initialize host worktrees."""
@@ -320,12 +369,7 @@ async def clone_and_create_project(
     slug = re.sub(r"[^a-z0-9-]", "-", payload.name.lower()).strip("-")
     slug = f"{slug}-{nanoid.generate(size=6)}"
 
-    result = await db.execute(select(Organization).limit(1))
-    org = result.scalar_one_or_none()
-    if not org:
-        org = Organization(name="Default Org", slug="default-org", plan_tier="pro")
-        db.add(org)
-        await db.flush()
+    org = await _ensure_user_org(db, user.user_id)
 
     project = Project(
         organization_id=org.id,
@@ -452,6 +496,8 @@ async def create_github_pull_request(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Push the active worktree branch and register a GitHub pull request."""
+    project_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = project_res.scalar_one_or_none()
     runner = get_runner()
     push_success = True
     push_msg = "Branch synced"
@@ -517,6 +563,24 @@ async def get_project_host(
     }
 
 
+# Estimated host pricing from prd.md section 9 (~$0.07/CPU-hr, ~$0.04/GB-hr).
+# ASSUMPTION: the "standard" host size is 1 vCPU and 2 GB. No size-to-spec mapping exists yet.
+HOST_CPU_USD_PER_HOUR = 0.07
+HOST_GB_USD_PER_HOUR = 0.04
+HOST_STANDARD_CPU = 1
+HOST_STANDARD_GB = 2
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _accrue_awake_time(host: Host, now: datetime) -> None:
+    """Add the awake time since the last wake to this month's total. Call before the host sleeps."""
+    if host.state == "awake" and host.last_wake_at is not None:
+        host.awake_seconds_month += int((now - _as_utc(host.last_wake_at)).total_seconds())
+
+
 @router.post("/{project_id}/host/sleep")
 async def sleep_project_host(
     project_id: str,
@@ -531,8 +595,10 @@ async def sleep_project_host(
     runner = get_runner()
     await runner.sleep_host(host.id)
 
+    now = datetime.now(timezone.utc)
+    _accrue_awake_time(host, now)
     host.state = "asleep"
-    host.last_sleep_at = datetime.now(timezone.utc)
+    host.last_sleep_at = now
 
     event = ActivityEvent(
         project_id=project_id,
@@ -571,6 +637,30 @@ async def wake_project_host(
     await db.commit()
 
     return {"status": "awake", "host_id": host.id}
+
+
+@router.get("/{project_id}/host/usage")
+async def get_project_host_usage(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Awake time this month and estimated host cost, including the current awake session."""
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found for project")
+
+    awake_seconds = host.awake_seconds_month
+    if host.state == "awake" and host.last_wake_at is not None:
+        awake_seconds += int((datetime.now(timezone.utc) - _as_utc(host.last_wake_at)).total_seconds())
+
+    rate = HOST_CPU_USD_PER_HOUR * HOST_STANDARD_CPU + HOST_GB_USD_PER_HOUR * HOST_STANDARD_GB
+    return {
+        "state": host.state,
+        "awake_seconds_month": awake_seconds,
+        "rate_usd_per_hour": round(rate, 4),
+        "estimated_cost_usd_month": round(awake_seconds / 3600 * rate, 2),
+    }
 
 
 @router.get("/{project_id}/services")
