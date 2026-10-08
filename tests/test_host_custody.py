@@ -18,11 +18,14 @@ import pytest
 from src.contexts.congruence.models import HarnessAuth
 from src.infrastructure.auth.harness_login import (
     CALLBACK_PORTS,
+    LOGIN_BLOCKERS,
+    SUPPORTED_HARNESSES,
     HarnessLoginError,
     LoginSessionRegistry,
     build_login_command,
     credential_path,
     extract_authorize_url,
+    login_flow,
 )
 
 # --- Login command construction -------------------------------------------
@@ -31,12 +34,22 @@ from src.infrastructure.auth.harness_login import (
 def test_login_command_uses_vendor_cli() -> None:
     assert build_login_command("claude") == ["claude", "login"]
     assert build_login_command("codex") == ["codex", "login"]
+    # Antigravity has no headless login subcommand; launching the TUI is what
+    # triggers its remote OAuth sign-in flow.
+    assert build_login_command("antigravity") == ["agy"]
+    assert "antigravity" in SUPPORTED_HARNESSES
+    # OpenCode's sign-in is its interactive provider picker.
+    assert build_login_command("opencode") == ["opencode", "auth", "login"]
+    assert "opencode" in SUPPORTED_HARNESSES
 
 
 def test_unsupported_harness_is_rejected() -> None:
+    # Aider has no vendor sign-in to relay: it is API-key driven via the host
+    # environment, so there is no login command we could honestly define.
     with pytest.raises(HarnessLoginError) as exc:
-        build_login_command("opencode")
+        build_login_command("aider")
     assert exc.value.code == "unsupported_harness"
+    assert "aider" in LOGIN_BLOCKERS
 
 
 def test_callback_ports_are_allowlisted() -> None:
@@ -44,6 +57,9 @@ def test_callback_ports_are_allowlisted() -> None:
     # whatever a process on the host happens to be listening on.
     assert set(CALLBACK_PORTS) == {"claude", "codex"}
     assert all(isinstance(p, int) and 1024 < p < 65536 for p in CALLBACK_PORTS.values())
+    # Antigravity's remote OAuth flow never binds a loopback port: the CLI
+    # prints an authorization URL and takes the code back as terminal input.
+    assert "antigravity" not in CALLBACK_PORTS
 
 
 # --- Authorize URL extraction ---------------------------------------------
@@ -137,8 +153,28 @@ def test_harness_auth_columns_are_all_safe_types() -> None:
         assert isinstance(col.type, safe), f"unexpected type on {col.name}: {col.type}"
 
 
+def test_login_flow_matches_harness_signin_style() -> None:
+    assert login_flow("claude") == "loopback_bridge"
+    assert login_flow("codex") == "loopback_bridge"
+    assert login_flow("antigravity") == "url_paste"
+    assert login_flow("opencode") == "interactive"
+
+
+def test_antigravity_login_session_uses_registry() -> None:
+    reg = LoginSessionRegistry()
+    session = reg.start("lane_agy", "antigravity")
+    assert session.state == "awaiting_user"
+    assert session.harness == "antigravity"
+    # No bridge is attached for antigravity; the URL surfaces via the PTY.
+    assert session.callback_port is None
+
+
 def test_credential_paths_are_host_side_only() -> None:
     # We reference the path only to ask the host whether the file exists.
     assert credential_path("claude") == "~/.claude/.credentials.json"
     assert credential_path("codex") == "~/.codex/auth.json"
+    # Antigravity keeps its token in the OS keyring; the CLI home directory is
+    # only a presence marker, never a credential we can read or restore.
+    assert credential_path("antigravity") == "~/.gemini/antigravity-cli/"
+    assert credential_path("opencode") == "~/.local/share/opencode/auth.json"
     assert credential_path("aider") is None
