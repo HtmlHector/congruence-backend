@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -37,6 +37,7 @@ from src.contexts.congruence.models import (
 from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.harness_login import (
     LOGIN_BLOCKERS,
+    MAX_LOGIN_SECONDS,
     SUPPORTED_HARNESSES,
     HarnessLoginError,
     build_login_command,
@@ -355,11 +356,23 @@ async def get_integrations_status(
         auth_res = await db.execute(
             select(HarnessAuth).where(HarnessAuth.lane_id.in_(lane_ids))
         )
+        # A pending or failed handshake is only trustworthy for as long as the
+        # login registry itself keeps sessions (MAX_LOGIN_SECONDS). An
+        # "awaiting_user" row past that age means the user abandoned sign-in;
+        # reporting it forever would block the "not connected" affordances.
+        stale_cutoff = datetime.now(UTC) - timedelta(seconds=MAX_LOGIN_SECONDS)
         for row in auth_res.scalars().all():
+            state = row.state
+            if state in ("awaiting_user", "error") and row.checked_at is not None:
+                checked = row.checked_at
+                if checked.tzinfo is None:
+                    checked = checked.replace(tzinfo=UTC)
+                if checked < stale_cutoff:
+                    state = "disconnected"
             current = harness_states.get(row.harness, "disconnected")
             rank = {"disconnected": 0, "error": 1, "awaiting_user": 2, "connected": 3}
-            if rank.get(row.state, 0) >= rank.get(current, 0):
-                harness_states[row.harness] = row.state
+            if rank.get(state, 0) >= rank.get(current, 0):
+                harness_states[row.harness] = state
 
     # Check user github connection
     gh_res = await db.execute(
