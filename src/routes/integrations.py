@@ -34,6 +34,7 @@ from src.contexts.congruence.models import (
     Project,
     Publication,
 )
+from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.harness_login import (
     SUPPORTED_HARNESSES,
     HarnessLoginError,
@@ -41,9 +42,11 @@ from src.infrastructure.auth.harness_login import (
     credential_path,
     registry,
 )
+from src.infrastructure.auth.jwt import UserClaims
+from src.infrastructure.auth.tenancy import require_lane_access, require_project_access
 from src.infrastructure.database.session import get_db_session
 from src.infrastructure.github.client import GitHubClient
-from src.infrastructure.github.oauth import GitHubOAuth
+from src.infrastructure.github.oauth import GitHubOAuth, issue_oauth_state, verify_oauth_state
 
 router = APIRouter(prefix="/integrations", tags=["Integrations & OAuth"])
 
@@ -66,6 +69,7 @@ class ConnectPATRequest(BaseModel):
 @router.post("/github/connect-pat")
 async def connect_github_pat(
     payload: ConnectPATRequest,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Connect GitHub account using a Personal Access Token (PAT)."""
@@ -94,8 +98,8 @@ async def connect_github_pat(
     username = user_info.get("login")
     avatar_url = user_info.get("avatar_url")
 
-    # Upsert default user GitHub account
-    user_id = "usr_default"
+    # Upsert the signed-in user's GitHub account
+    user_id = user.user_id
     stmt = select(GitHubAccount).where(GitHubAccount.user_id == user_id)
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
@@ -132,10 +136,11 @@ async def connect_github_pat(
 
 
 @router.get("/github/connect")
-async def github_connect() -> dict[str, str]:
-    """Generate GitHub OAuth 2.0 authorization URL."""
+async def github_connect(user: UserClaims = Depends(get_current_user)) -> dict[str, str]:
+    """Generate GitHub OAuth 2.0 authorization URL bound to the caller."""
     oauth = GitHubOAuth()
-    auth_url = oauth.get_authorize_url()
+    state = issue_oauth_state(user.user_id)
+    auth_url = oauth.get_authorize_url(state=state)
     return {
         "provider": "github",
         "authorize_url": auth_url,
@@ -165,6 +170,14 @@ async def github_oauth_callback(
     if not code:
         return RedirectResponse(
             url=f"{frontend_base}/workspace?github_error=missing_code"
+        )
+
+    # The callback carries no Authorization header; the signed state issued by
+    # /github/connect identifies which user initiated this OAuth flow.
+    oauth_user_id = verify_oauth_state(state)
+    if oauth_user_id is None:
+        return RedirectResponse(
+            url=f"{frontend_base}/workspace?github_error=invalid_state"
         )
 
     oauth = GitHubOAuth()
@@ -197,8 +210,8 @@ async def github_oauth_callback(
     username = user_info.get("login")
     avatar_url = user_info.get("avatar_url")
 
-    # Upsert default user GitHub account
-    user_id = "usr_default"
+    # Upsert the GitHub account for the user identified by the signed state
+    user_id = oauth_user_id
     stmt = select(GitHubAccount).where(GitHubAccount.user_id == user_id)
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
@@ -233,11 +246,12 @@ async def github_oauth_callback(
 
 @router.get("/github/status")
 async def get_github_status(
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Get active user GitHub integration status."""
     stmt = select(GitHubAccount).where(
-        GitHubAccount.user_id == "usr_default",
+        GitHubAccount.user_id == user.user_id,
         GitHubAccount.is_active == True,
     )
     res = await db.execute(stmt)
@@ -267,11 +281,12 @@ async def get_github_status(
 
 @router.get("/github/repos")
 async def get_github_repos(
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> list[dict[str, Any]]:
     """List accessible GitHub repositories for the connected user."""
     stmt = select(GitHubAccount).where(
-        GitHubAccount.user_id == "usr_default",
+        GitHubAccount.user_id == user.user_id,
         GitHubAccount.is_active == True,
     )
     res = await db.execute(stmt)
@@ -292,10 +307,11 @@ async def get_github_repos(
 
 @router.delete("/github/disconnect")
 async def disconnect_github(
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Disconnect GitHub and deactivate stored access token."""
-    stmt = select(GitHubAccount).where(GitHubAccount.user_id == "usr_default")
+    stmt = select(GitHubAccount).where(GitHubAccount.user_id == user.user_id)
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
 
@@ -316,9 +332,11 @@ async def disconnect_github(
 @router.get("/status/{project_id}")
 async def get_integrations_status(
     project_id: str,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Report connected integrations for the project."""
+    await require_project_access(db, user, project_id)
     project_res = await db.execute(select(Project).where(Project.id == project_id))
     project = project_res.scalar_one_or_none()
     if not project:
@@ -343,7 +361,7 @@ async def get_integrations_status(
     # Check user github connection
     gh_res = await db.execute(
         select(GitHubAccount).where(
-            GitHubAccount.user_id == "usr_default",
+            GitHubAccount.user_id == user.user_id,
             GitHubAccount.is_active == True,
         )
     )
@@ -372,7 +390,9 @@ async def get_integrations_status(
 
 
 @router.get("/github/install-url")
-async def get_github_install_url() -> dict[str, str]:
+async def get_github_install_url(
+    user: UserClaims = Depends(get_current_user),
+) -> dict[str, str]:
     """Return public GitHub App installation URL for repository authorization."""
     return {
         "install_url": f"https://github.com/apps/{settings.github.app_slug}/installations/new",
@@ -421,6 +441,7 @@ async def _upsert_state(
 async def start_harness_login(
     harness: str,
     lane_id: str,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Begin a host-native login for a harness on a lane.
@@ -431,6 +452,7 @@ async def start_harness_login(
     binds its loopback callback port.
     """
     await _get_lane_or_404(db, lane_id)
+    await require_lane_access(db, user, lane_id)
 
     try:
         command = build_login_command(harness)
@@ -460,10 +482,12 @@ async def start_harness_login(
 async def get_harness_login_status(
     harness: str,
     lane_id: str,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Poll an in-flight host-native login."""
     await _get_lane_or_404(db, lane_id)
+    await require_lane_access(db, user, lane_id)
     session = registry.get(lane_id)
 
     if session is None:
@@ -502,6 +526,7 @@ async def get_harness_login_status(
 async def disconnect_harness(
     harness: str,
     lane_id: str,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Mark a harness disconnected after deleting its credential on the host.
@@ -511,6 +536,7 @@ async def disconnect_harness(
     responsible for removing the credential file. Irreversible by design.
     """
     await _get_lane_or_404(db, lane_id)
+    await require_lane_access(db, user, lane_id)
     registry.clear(lane_id)
     await _upsert_state(db, lane_id, harness, "disconnected")
     await db.commit()
@@ -538,12 +564,13 @@ async def handle_github_webhook(
     raw_body = await request.body()
     webhook_secret = settings.github.webhook_secret.get_secret_value() if settings.github.webhook_secret else None
 
-    # Validate HMAC signature if secret is configured and signature provided
-    if webhook_secret and x_hub_signature_256:
+    # Validate HMAC signature. When a secret is configured a valid signature
+    # is mandatory; unsigned requests are rejected.
+    if webhook_secret:
         expected_sig = "sha256=" + hmac.new(
             webhook_secret.encode("utf-8"), raw_body, hashlib.sha256
         ).hexdigest()
-        if not hmac.compare_digest(expected_sig, x_hub_signature_256):
+        if not x_hub_signature_256 or not hmac.compare_digest(expected_sig, x_hub_signature_256):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:

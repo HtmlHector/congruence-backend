@@ -12,8 +12,8 @@ async def test_agent_chat_stream_endpoint():
             json={
                 "prompt": "echo 'hello from test runner'",
                 "harness": "Shell",
-                "cwd": ".",
             },
+            headers={"Authorization": "Bearer mock_stream_user"},
         )
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]

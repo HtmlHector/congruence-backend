@@ -27,6 +27,7 @@ from src.contexts.congruence.models import (
 )
 from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.jwt import UserClaims
+from src.infrastructure.auth.tenancy import require_project_access
 from src.infrastructure.database.session import get_db_session
 from src.infrastructure.runner.registry import get_runner
 
@@ -59,13 +60,7 @@ async def scope_project_access(
     project_id = request.path_params.get("project_id")
     if project_id is None:
         return
-    res = await db.execute(
-        select(Project.id)
-        .join(OrganizationMember, OrganizationMember.organization_id == Project.organization_id)
-        .where(Project.id == project_id, OrganizationMember.user_id == user.user_id)
-    )
-    if res.first() is None:
-        raise HTTPException(status_code=404, detail="Project not found")
+    await require_project_access(db, user, project_id)
 
 
 router = APIRouter(
@@ -466,7 +461,7 @@ async def clone_and_create_project(
     if not auth_token:
         gh_res = await db.execute(
             select(GitHubAccount).where(
-                GitHubAccount.user_id == "usr_default",
+                GitHubAccount.user_id == user.user_id,
                 GitHubAccount.is_active == True,
             )
         )

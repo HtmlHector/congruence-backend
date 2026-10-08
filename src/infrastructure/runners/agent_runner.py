@@ -69,10 +69,8 @@ CODEX_MODEL_MAP = {
 _chat_conversation_map: dict[str, str] = {}
 
 
-async def _ensure_project_repo(project_name: str, branch: str = "main") -> str:
-    """Ensure project directory exists on disk with real files, initialized git,
-    and isolated branch worktree.
-    """
+def project_slug(project_name: str) -> str:
+    """Normalize a project identifier into its on-disk directory slug."""
     clean_slug = project_name.lower().replace(" ", "-").replace("/", "-")
     if "ecommerce" in clean_slug:
         clean_slug = "ecommerce-test-app"
@@ -82,8 +80,20 @@ async def _ensure_project_repo(project_name: str, branch: str = "main") -> str:
         clean_slug = "congruence-backend"
     elif "frontend" in clean_slug:
         clean_slug = "congruence-frontend"
+    return clean_slug
 
-    base_dir = os.path.expanduser(f"~/.congruence/projects/{clean_slug}")
+
+def project_workspace_dir(project_name: str) -> str:
+    """Resolve the on-disk workspace root for a project identifier."""
+    return os.path.expanduser(f"~/.congruence/projects/{project_slug(project_name)}")
+
+
+async def _ensure_project_repo(project_name: str, branch: str = "main") -> str:
+    """Ensure project directory exists on disk with real files, initialized git,
+    and isolated branch worktree.
+    """
+    clean_slug = project_slug(project_name)
+    base_dir = project_workspace_dir(project_name)
     os.makedirs(base_dir, exist_ok=True)
 
     # Seed AGENTS.md and CLAUDE.md workspace instructions if not already present

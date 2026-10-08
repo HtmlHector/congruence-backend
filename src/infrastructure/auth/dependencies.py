@@ -122,12 +122,17 @@ async def get_current_user_id(
         raise HTTPException(status_code=404, detail="User record not found")
 
 
-async def require_workspace_member(
+async def check_workspace_membership(
+    db: AsyncSession,
+    user: UserClaims,
     workspace_id: str,
-    user: UserClaims = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """FastAPI dependency: verifies workspace membership and binds RLS scope."""
+    """Verify the caller is a member of ``workspace_id``.
+
+    Raises 403 on any mismatch. There is deliberately no development
+    auto-heal here: in debug mode this previously granted OWNER on any
+    workspace to any authenticated user, which defeated tenancy entirely.
+    """
     # If authenticated via workspace-scoped API key, check match
     if user.auth_method == "api_key" and user.workspace_id and user.workspace_id != workspace_id:
         raise HTTPException(status_code=403, detail="API key not authorized for this workspace")
@@ -147,57 +152,27 @@ async def require_workspace_member(
     )
     row = result.fetchone()
 
-    # In development or initial setup, auto-heal if user owns workspace or first member
-    if not row and settings.debug:
-        ws_exists = (
-            await db.execute(
-                text("SELECT workspace_id FROM workspace.workspaces WHERE workspace_id = :ws_id"),
-                {"ws_id": workspace_id},
-            )
-        ).fetchone()
-        if ws_exists:
-            # Grant OWNER role in dev
-            role_row = (
-                await db.execute(
-                    text("SELECT role_id FROM identity.roles WHERE name = 'OWNER' LIMIT 1")
-                )
-            ).fetchone()
-            role_id = role_row[0] if role_row else "00000000-0000-0000-0000-000000000001"
-            # Ensure user exists in identity.users
-            u_row = (
-                await db.execute(
-                    text("SELECT user_id FROM identity.users WHERE supabase_user_id = :uid"),
-                    {"uid": user.user_id},
-                )
-            ).fetchone()
-            if not u_row:
-                import uuid
-
-                new_uid = uuid.uuid4()
-                await db.execute(
-                    text(
-                        "INSERT INTO identity.users (user_id, supabase_user_id, email, full_name) VALUES (:uid, :sub, :email, 'Dev User') ON CONFLICT DO NOTHING"
-                    ),
-                    {"uid": new_uid, "sub": user.user_id, "email": user.email},
-                )
-                u_id = new_uid
-            else:
-                u_id = u_row[0]
-
-            await db.execute(
-                text(
-                    "INSERT INTO workspace.memberships (user_id, workspace_id, role_id) VALUES (:uid, :ws_id, :role_id) ON CONFLICT DO NOTHING"
-                ),
-                {"uid": u_id, "ws_id": workspace_id, "role_id": role_id},
-            )
-            await db.commit()
-            row = ("OWNER", ["*"])
-
     if not row:
         raise HTTPException(status_code=403, detail="Not a member of this workspace")
 
     role_name = row[0] or "MEMBER"
     permissions = row[1] or []
+
+    return {
+        "user_id": user.user_id,
+        "workspace_id": workspace_id,
+        "role": role_name,
+        "permissions": permissions,
+    }
+
+
+async def require_workspace_member(
+    workspace_id: str,
+    user: UserClaims = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """FastAPI dependency: verifies workspace membership and binds RLS scope."""
+    membership = await check_workspace_membership(db, user, workspace_id)
 
     # Bind transaction RLS context
     await bind_rls_workspace(
@@ -209,12 +184,7 @@ async def require_workspace_member(
         ),
     )
 
-    return {
-        "user_id": user.user_id,
-        "workspace_id": workspace_id,
-        "role": role_name,
-        "permissions": permissions,
-    }
+    return membership
 
 
 def require_permission(permission: str) -> Callable:

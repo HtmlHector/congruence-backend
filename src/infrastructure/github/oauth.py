@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import secrets
+import time
 from urllib.parse import urlencode
 
 import httpx
@@ -11,6 +15,49 @@ from src.config.settings import settings
 
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+
+_OAUTH_STATE_TTL_SECONDS = 600
+
+
+def _state_secret() -> bytes:
+    return settings.auth.supabase_jwt_secret.encode("utf-8")
+
+
+def issue_oauth_state(user_id: str, ttl_seconds: int = _OAUTH_STATE_TTL_SECONDS) -> str:
+    """Mint a signed, short-lived OAuth state binding a callback to ``user_id``.
+
+    The GitHub OAuth callback arrives as a bare browser redirect with no
+    Authorization header, so the initiating user's identity must travel in
+    the state parameter — signed so it cannot be forged to store a token
+    under someone else's account.
+    """
+    body = f"{user_id}.{int(time.time()) + ttl_seconds}"
+    sig = hmac.new(_state_secret(), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    raw = f"{body}.{sig}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def verify_oauth_state(state: str | None) -> str | None:
+    """Return the bound user_id when ``state`` is valid and unexpired."""
+    if not state:
+        return None
+    try:
+        padded = state + "=" * (-len(state) % 4)
+        raw = base64.urlsafe_b64decode(padded).decode("utf-8")
+        user_id, expiry, sig = raw.rsplit(".", 2)
+    except Exception:
+        return None
+
+    body = f"{user_id}.{expiry}"
+    expected = hmac.new(_state_secret(), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        if int(expiry) < int(time.time()):
+            return None
+    except ValueError:
+        return None
+    return user_id or None
 
 
 class GitHubOAuthError(Exception):
