@@ -106,7 +106,7 @@ async def session_websocket_endpoint(websocket: WebSocket, session_id: str) -> N
                 # Stream stdout/stderr task with localhost rewrite and service detection
                 import re
 
-                async def _stream_pty(p_id: str):
+                async def _stream_pty(p_id: str, stream_lane_id: str):
                     try:
                         async for chunk in runner.read_pty_stream(p_id):
                             # Detect and rewrite localhost:PORT links to private preview URLs
@@ -116,7 +116,7 @@ async def session_websocket_endpoint(websocket: WebSocket, session_id: str) -> N
                             ports_found = re.findall(pattern, chunk)
                             if ports_found:
                                 for p in ports_found:
-                                    preview_target = f"/preview/{lane_id}/{p}/ [HTTPS private]"
+                                    preview_target = f"/preview/{stream_lane_id}/{p}/ [HTTPS private]"
                                     rewritten = re.sub(
                                         rf"http://(?:localhost|127\.0\.0\.1):{p}",
                                         preview_target,
@@ -127,10 +127,10 @@ async def session_websocket_endpoint(websocket: WebSocket, session_id: str) -> N
                                         session_id,
                                         {
                                             "type": "dev_server_status",
-                                            "lane_id": lane_id,
+                                            "lane_id": stream_lane_id,
                                             "is_running": True,
                                             "port": int(p),
-                                            "url": f"/preview/{lane_id}/{p}/",
+                                            "url": f"/preview/{stream_lane_id}/{p}/",
                                         },
                                     )
 
@@ -141,7 +141,7 @@ async def session_websocket_endpoint(websocket: WebSocket, session_id: str) -> N
                     except Exception:
                         pass
 
-                tasks.append(asyncio.create_task(_stream_pty(pty_id)))
+                tasks.append(asyncio.create_task(_stream_pty(pty_id, lane_id)))
 
             # 2. PTY Input Write (Checked against lane write grant)
             elif msg_type == "pty_input":

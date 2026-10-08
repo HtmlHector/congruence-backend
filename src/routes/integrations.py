@@ -12,18 +12,28 @@ vendor's credential file?) rather than known by us.
 
 from __future__ import annotations
 
-import os
-from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
+from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.settings import settings
-from src.contexts.congruence.models import HarnessAuth, Host, Lane, Project, GitHubAccount
+from src.contexts.congruence.models import (
+    ActivityEvent,
+    GitHubAccount,
+    HarnessAuth,
+    Host,
+    Lane,
+    Project,
+    Publication,
+)
 from src.infrastructure.auth.harness_login import (
     SUPPORTED_HARNESSES,
     HarnessLoginError,
@@ -32,8 +42,8 @@ from src.infrastructure.auth.harness_login import (
     registry,
 )
 from src.infrastructure.database.session import get_db_session
-from src.infrastructure.github.client import GitHubClient, GitHubClientError
-from src.infrastructure.github.oauth import GitHubOAuth, GitHubOAuthError
+from src.infrastructure.github.client import GitHubClient
+from src.infrastructure.github.oauth import GitHubOAuth
 
 router = APIRouter(prefix="/integrations", tags=["Integrations & OAuth"])
 
@@ -90,7 +100,7 @@ async def github_oauth_callback(
         token_data = await oauth.exchange_code(code)
     except Exception as exc:
         return RedirectResponse(
-            url=f"{frontend_base}/workspace?github_error=token_exchange_failed&detail={str(exc)}"
+            url=f"{frontend_base}/workspace?github_error=token_exchange_failed&detail={exc!s}"
         )
 
     access_token = token_data.get("access_token")
@@ -156,7 +166,7 @@ async def get_github_status(
     """Get active user GitHub integration status."""
     stmt = select(GitHubAccount).where(
         GitHubAccount.user_id == "usr_default",
-        GitHubAccount.is_active == True,  # noqa: E712
+        GitHubAccount.is_active == True,
     )
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
@@ -190,7 +200,7 @@ async def get_github_repos(
     """List accessible GitHub repositories for the connected user."""
     stmt = select(GitHubAccount).where(
         GitHubAccount.user_id == "usr_default",
-        GitHubAccount.is_active == True,  # noqa: E712
+        GitHubAccount.is_active == True,
     )
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
@@ -203,7 +213,7 @@ async def get_github_repos(
         repos = await client.list_user_repos(per_page=100)
         return repos
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch repositories from GitHub: {str(exc)}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch repositories from GitHub: {exc!s}")
     finally:
         await client.close()
 
@@ -262,7 +272,7 @@ async def get_integrations_status(
     gh_res = await db.execute(
         select(GitHubAccount).where(
             GitHubAccount.user_id == "usr_default",
-            GitHubAccount.is_active == True,  # noqa: E712
+            GitHubAccount.is_active == True,
         )
     )
     gh_account = gh_res.scalar_one_or_none()
@@ -322,7 +332,7 @@ async def _upsert_state(
         )
     )
     row = res.scalar_one_or_none()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     if row is None:
         row = HarnessAuth(lane_id=lane_id, harness=harness, state=state)
@@ -442,3 +452,120 @@ async def disconnect_harness(
             "held them. The user must sign in again with the vendor."
         ),
     }
+
+
+@router.post("/github/webhooks")
+@router.post("/github/webhook")
+async def handle_github_webhook(
+    request: Request,
+    x_github_event: str | None = Header(None, alias="X-GitHub-Event"),
+    x_hub_signature_256: str | None = Header(None, alias="X-Hub-Signature-256"),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Process incoming GitHub webhooks (PR status updates, branch push sync)."""
+    raw_body = await request.body()
+    webhook_secret = settings.github.webhook_secret.get_secret_value() if settings.github.webhook_secret else None
+
+    # Validate HMAC signature if secret is configured and signature provided
+    if webhook_secret and x_hub_signature_256:
+        expected_sig = "sha256=" + hmac.new(
+            webhook_secret.encode("utf-8"), raw_body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected_sig, x_hub_signature_256):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except Exception:
+        payload = {}
+
+    event_type = x_github_event or "ping"
+
+    if event_type == "ping":
+        return {"status": "ok", "event": "ping", "message": "Pong"}
+
+    if event_type == "pull_request":
+        action = payload.get("action")
+        pr_data = payload.get("pull_request", {})
+        pr_number = pr_data.get("number")
+        pr_url = pr_data.get("html_url")
+        head_branch = pr_data.get("head", {}).get("ref")
+        is_merged = pr_data.get("merged", False)
+
+        new_status = "merged" if is_merged else ("closed" if action == "closed" else "open")
+
+        # Find matching lane and publication
+        if head_branch:
+            lane_res = await db.execute(select(Lane).where(Lane.branch_name == head_branch))
+            lane = lane_res.scalar_one_or_none()
+            if lane:
+                pub_res = await db.execute(select(Publication).where(Publication.lane_id == lane.id))
+                pub = pub_res.scalar_one_or_none()
+                if pub:
+                    pub.status = new_status
+                    if pr_number:
+                        pub.pr_number = pr_number
+                    if pr_url:
+                        pub.pr_url = pr_url
+                elif pr_number and pr_url:
+                    pub = Publication(
+                        lane_id=lane.id,
+                        actor_id="act_github_webhook",
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        status=new_status,
+                    )
+                    db.add(pub)
+
+                host_res = await db.execute(select(Host).where(Host.id == lane.host_id))
+                host = host_res.scalar_one_or_none()
+                if host:
+                    event = ActivityEvent(
+                        project_id=host.project_id,
+                        lane_id=lane.id,
+                        action_type=f"github_pr_{action}",
+                        summary=f"GitHub PR #{pr_number} ({head_branch}) {new_status}",
+                    )
+                    db.add(event)
+
+                await db.commit()
+
+        return {
+            "status": "processed",
+            "event": "pull_request",
+            "action": action,
+            "pr_number": pr_number,
+            "pr_status": new_status,
+        }
+
+    if event_type == "push":
+        ref = payload.get("ref", "")
+        branch_name = ref.replace("refs/heads/", "")
+        head_commit = payload.get("head_commit", {})
+        commit_sha = head_commit.get("id")
+        commit_msg = head_commit.get("message", "")
+
+        lane_res = await db.execute(select(Lane).where(Lane.branch_name == branch_name))
+        lane = lane_res.scalar_one_or_none()
+        if lane:
+            host_res = await db.execute(select(Host).where(Host.id == lane.host_id))
+            host = host_res.scalar_one_or_none()
+            if host:
+                event = ActivityEvent(
+                    project_id=host.project_id,
+                    lane_id=lane.id,
+                    action_type="github_push",
+                    summary=f"Pushed to branch {branch_name}: {commit_msg[:60]} ({commit_sha[:7] if commit_sha else ''})",
+                )
+                db.add(event)
+                await db.commit()
+
+        return {
+            "status": "processed",
+            "event": "push",
+            "branch": branch_name,
+            "commit_sha": commit_sha,
+        }
+
+    return {"status": "ignored", "event": event_type}
+

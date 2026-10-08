@@ -179,6 +179,7 @@ class LocalProcessRunner(HostBackend):
         # Query DB for lane and host repository
         try:
             from sqlalchemy import select
+
             from src.contexts.congruence.models import Host, Lane
             from src.infrastructure.database.session import AsyncSessionFactory
 
@@ -323,6 +324,7 @@ class LocalProcessRunner(HostBackend):
         else:
             try:
                 from sqlalchemy import select
+
                 from src.contexts.congruence.models import Lane
                 from src.infrastructure.database.session import AsyncSessionFactory
                 async with AsyncSessionFactory() as session:
@@ -585,6 +587,7 @@ fi
         else:
             try:
                 from sqlalchemy import select
+
                 from src.contexts.congruence.models import Lane
                 from src.infrastructure.database.session import AsyncSessionFactory
                 async with AsyncSessionFactory() as session:

@@ -11,7 +11,7 @@ that are cheap to assert and expensive to lose:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -24,7 +24,6 @@ from src.infrastructure.auth.harness_login import (
     credential_path,
     extract_authorize_url,
 )
-
 
 # --- Login command construction -------------------------------------------
 
@@ -93,7 +92,7 @@ def test_authorize_url_is_exposed_only_while_pending() -> None:
 def test_expired_session_is_marked_error_and_url_withheld() -> None:
     reg = LoginSessionRegistry()
     session = reg.start("lane_1", "codex")
-    session.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    session.expires_at = datetime.now(UTC) - timedelta(seconds=1)
 
     expired = reg.get("lane_1")
     assert expired.state == "error"

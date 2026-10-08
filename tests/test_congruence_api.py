@@ -32,6 +32,7 @@ def override_get_current_user() -> UserClaims:
 async def prepare_database():
     orig_get_db = app.dependency_overrides.get(get_db)
     orig_get_db_session = app.dependency_overrides.get(get_db_session)
+    orig_get_user = app.dependency_overrides.get(get_current_user)
     app.dependency_overrides[get_db] = override_get_test_db
     app.dependency_overrides[get_db_session] = override_get_test_db
     app.dependency_overrides[get_current_user] = override_get_current_user
@@ -54,7 +55,10 @@ async def prepare_database():
     else:
         app.dependency_overrides.pop(get_db_session, None)
 
-    app.dependency_overrides.pop(get_current_user, None)
+    if orig_get_user is not None:
+        app.dependency_overrides[get_current_user] = orig_get_user
+    else:
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import nanoid
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -36,6 +37,13 @@ class Organization(Base, TimestampMixin):
     plan_tier: Mapped[str] = mapped_column(String(32), default="free", nullable=False)
     stripe_customer_id: Mapped[str | None] = mapped_column(
         String(128), unique=True, nullable=True
+    )
+    stripe_subscription_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    writer_seats_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    subscription_status: Mapped[str] = mapped_column(
+        String(32), default="active", nullable=False
     )
 
     projects: Mapped[list[Project]] = relationship(
@@ -76,6 +84,8 @@ class Project(Base, TimestampMixin):
     repo_full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     default_branch: Mapped[str] = mapped_column(String(64), default="main", nullable=False)
     visibility: Mapped[str] = mapped_column(String(32), default="private", nullable=False)
+    spend_cap_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    egress_limit_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     organization: Mapped[Organization] = relationship("Organization", back_populates="projects")
     host: Mapped[Host | None] = relationship(
@@ -106,8 +116,12 @@ class Host(Base, TimestampMixin):
         String(32), default="awake", nullable=False
     )  # 'awake' | 'asleep' | 'waking' | 'sleeping'
     size: Mapped[str] = mapped_column(String(32), default="standard", nullable=False)
+    cpu_count: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    memory_gb: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
     disk_size_gb: Mapped[int] = mapped_column(Integer, default=32, nullable=False)
     awake_seconds_month: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    egress_used_mb: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    auto_idle_minutes: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     last_wake_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sleep_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

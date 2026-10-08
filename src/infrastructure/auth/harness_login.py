@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 # Loopback ports the supported CLIs bind their OAuth callbacks to. Kept as an
 # explicit allowlist so a compromised or unexpected process on the host cannot
@@ -76,19 +76,19 @@ class HarnessLoginSession:
     device_code: str | None = None
     callback_port: int | None = None
     callback_service_id: str | None = None
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     expires_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
+        default_factory=lambda: datetime.now(UTC)
         + timedelta(seconds=CALLBACK_URL_TTL_SECONDS)
     )
     error_code: str | None = None
     error_message: str | None = None
 
     def is_expired(self, now: datetime | None = None) -> bool:
-        return (now or datetime.now(timezone.utc)) >= self.expires_at
+        return (now or datetime.now(UTC)) >= self.expires_at
 
     def seconds_remaining(self, now: datetime | None = None) -> int:
-        delta = self.expires_at - (now or datetime.now(timezone.utc))
+        delta = self.expires_at - (now or datetime.now(UTC))
         return max(0, int(delta.total_seconds()))
 
     def to_public_dict(self) -> dict[str, object]:

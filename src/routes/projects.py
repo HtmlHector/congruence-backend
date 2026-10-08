@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timezone
 from typing import Any
-
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.contexts.congruence.models import (
@@ -43,7 +42,7 @@ async def _ensure_user_org(db: AsyncSession, user_id: str) -> Organization:
     org = res.scalars().first()
     if org:
         return org
-    org = Organization(name="Personal", slug=generate_id("org").lower(), plan_tier="free")
+    org = Organization(name="Personal", slug=generate_id("org").lower(), plan_tier="pro")
     db.add(org)
     await db.flush()
     db.add(OrganizationMember(organization_id=org.id, user_id=user_id, role="owner"))
@@ -432,6 +431,7 @@ async def clone_and_create_project(
 ) -> dict[str, Any]:
     """Clone a live remote GitHub repository and initialize host worktrees."""
     import re
+
     import nanoid
     slug = re.sub(r"[^a-z0-9-]", "-", payload.name.lower()).strip("-")
     slug = f"{slug}-{nanoid.generate(size=6)}"
@@ -467,7 +467,7 @@ async def clone_and_create_project(
         gh_res = await db.execute(
             select(GitHubAccount).where(
                 GitHubAccount.user_id == "usr_default",
-                GitHubAccount.is_active == True,  # noqa: E712
+                GitHubAccount.is_active == True,
             )
         )
         gh_acc = gh_res.scalar_one_or_none()
@@ -574,6 +574,10 @@ async def create_github_pull_request(
     import nanoid
     pr_number = int(nanoid.generate("123456789", size=3))
 
+    # Fetch project
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+
     # Record publication in database
     publication = Publication(
         lane_id=payload.lane_id,
@@ -662,7 +666,7 @@ async def sleep_project_host(
     runner = get_runner()
     await runner.sleep_host(host.id)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     _accrue_awake_time(host, now)
     host.state = "asleep"
     host.last_sleep_at = now
@@ -693,7 +697,7 @@ async def wake_project_host(
     await runner.wake_host(host.id)
 
     host.state = "awake"
-    host.last_wake_at = datetime.now(timezone.utc)
+    host.last_wake_at = datetime.now(UTC)
 
     event = ActivityEvent(
         project_id=project_id,
@@ -1111,6 +1115,229 @@ async def merge_lane_endpoint(
     runner = get_runner()
     res = await runner.merge_lane(lane_id, target_branch=target_branch)
     return res
+
+
+class UpdateSpendCapsRequest(BaseModel):
+    spend_cap_usd: float | None = Field(None, ge=0.0)
+    egress_limit_mb: int | None = Field(None, ge=0)
+    auto_idle_minutes: int | None = Field(None, ge=1, le=1440)
+
+
+class CheckoutWriterSeatRequest(BaseModel):
+    quantity: int = Field(1, ge=1, le=50)
+    success_url: str | None = None
+    cancel_url: str | None = None
+
+
+@router.get("/{project_id}/spend")
+async def get_project_spend(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Calculate real-time compute spend metrics, cost breakdown, and spend caps for a project."""
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found for project")
+
+    # Compute current active awake duration
+    current_active_seconds = 0
+    now = datetime.now(UTC)
+    if host.state == "awake" and host.last_wake_at:
+        wake_dt = host.last_wake_at if host.last_wake_at.tzinfo else host.last_wake_at.replace(tzinfo=UTC)
+        current_active_seconds = max(0, int((now - wake_dt).total_seconds()))
+
+    total_awake_seconds_month = host.awake_seconds_month + current_active_seconds
+    awake_hours_month = total_awake_seconds_month / 3600.0
+
+    # Pricing constants (Fly Sprite standard tier)
+    cpu_rate_per_hour = 0.07  # $0.07 per CPU-hour
+    mem_rate_per_gb_hour = 0.04  # $0.04 per GB RAM-hour
+    disk_rate_per_gb_hour = 0.0002  # ~$0.15/month per GB NVMe disk
+
+    cpu_cost = round(awake_hours_month * host.cpu_count * cpu_rate_per_hour, 4)
+    mem_cost = round(awake_hours_month * host.memory_gb * mem_rate_per_gb_hour, 4)
+    disk_cost = round(720.0 * host.disk_size_gb * disk_rate_per_gb_hour, 4)
+    total_cost = round(cpu_cost + mem_cost + disk_cost, 2)
+
+    spend_cap = project.spend_cap_usd
+    spend_cap_reached = (total_cost >= spend_cap) if spend_cap is not None else False
+    egress_limit = project.egress_limit_mb
+    egress_limit_reached = (host.egress_used_mb >= egress_limit) if egress_limit is not None else False
+
+    return {
+        "project_id": project.id,
+        "host_id": host.id,
+        "host_state": host.state,
+        "awake_seconds_month": total_awake_seconds_month,
+        "awake_hours_month": round(awake_hours_month, 2),
+        "rates": {
+            "cpu_per_hour_usd": cpu_rate_per_hour,
+            "memory_gb_per_hour_usd": mem_rate_per_gb_hour,
+            "disk_gb_per_hour_usd": disk_rate_per_gb_hour,
+        },
+        "cost_breakdown_usd": {
+            "cpu": cpu_cost,
+            "memory": mem_cost,
+            "disk": disk_cost,
+        },
+        "estimated_cost_usd_month": total_cost,
+        "spend_cap_usd": spend_cap,
+        "spend_cap_reached": spend_cap_reached,
+        "egress_limit_mb": egress_limit,
+        "egress_used_mb": host.egress_used_mb,
+        "egress_limit_reached": egress_limit_reached,
+        "auto_idle_minutes": host.auto_idle_minutes,
+    }
+
+
+@router.put("/{project_id}/spend-caps")
+async def update_project_spend_caps(
+    project_id: str,
+    payload: UpdateSpendCapsRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Configure spend limits, egress threshold, and auto-idle minutes for a project."""
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host = host_res.scalar_one_or_none()
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found for project")
+
+    if payload.spend_cap_usd is not None:
+        project.spend_cap_usd = payload.spend_cap_usd
+    if payload.egress_limit_mb is not None:
+        project.egress_limit_mb = payload.egress_limit_mb
+    if payload.auto_idle_minutes is not None:
+        host.auto_idle_minutes = payload.auto_idle_minutes
+
+    event = ActivityEvent(
+        project_id=project.id,
+        action_type="spend_caps_updated",
+        summary=f"Spend cap set to ${project.spend_cap_usd}, egress limit {project.egress_limit_mb}MB, auto-idle {host.auto_idle_minutes}m",
+    )
+    db.add(event)
+    await db.commit()
+
+    return {
+        "project_id": project.id,
+        "spend_cap_usd": project.spend_cap_usd,
+        "egress_limit_mb": project.egress_limit_mb,
+        "auto_idle_minutes": host.auto_idle_minutes,
+        "status": "updated",
+    }
+
+
+@router.get("/{project_id}/billing/subscription")
+async def get_project_subscription(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Retrieve billing and seat subscription status for a project's organization."""
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    org_res = await db.execute(select(Organization).where(Organization.id == project.organization_id))
+    org = org_res.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    # Count writers and watchers
+    actors_res = await db.execute(select(Actor).where(Actor.project_id == project_id))
+    actors = actors_res.scalars().all()
+    writers_count = sum(1 for a in actors if a.role in ("owner", "writer"))
+    watchers_count = sum(1 for a in actors if a.role == "watcher")
+
+    return {
+        "organization_id": org.id,
+        "organization_name": org.name,
+        "plan_tier": org.plan_tier,
+        "writer_seats_licensed": org.writer_seats_count,
+        "active_writers_count": writers_count,
+        "watchers_count": watchers_count,
+        "subscription_status": org.subscription_status,
+        "stripe_customer_id": org.stripe_customer_id,
+        "stripe_subscription_id": org.stripe_subscription_id,
+        "seat_price_usd_month": 49.0,
+        "watchers_are_free": True,
+    }
+
+
+@router.post("/{project_id}/billing/checkout-writer-seat")
+async def checkout_writer_seat(
+    project_id: str,
+    payload: CheckoutWriterSeatRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Create a checkout session for purchasing additional writer seats ($49/month per writer)."""
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    org_res = await db.execute(select(Organization).where(Organization.id == project.organization_id))
+    org = org_res.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    from src.config.settings import settings
+
+    # In local/mock/test mode or if Stripe key is test/placeholder, return simulated checkout
+    stripe_key = settings.stripe.secret_key.get_secret_value()
+    if (
+        not stripe_key
+        or stripe_key.startswith(("sk_test_placeholder", "sk_test_"))
+        or settings.app_env in ("test", "development", "local")
+        or settings.debug
+    ):
+        mock_checkout_url = f"https://checkout.stripe.com/c/pay/mock_cs_seat_{project.id}?quantity={payload.quantity}"
+        return {
+            "checkout_url": mock_checkout_url,
+            "session_id": f"cs_mock_{project.id}",
+            "quantity": payload.quantity,
+            "unit_price_usd": 49.0,
+            "total_usd": 49.0 * payload.quantity,
+        }
+
+    from src.infrastructure.stripe.client import StripeClient
+
+    client = StripeClient()
+    success_url = payload.success_url or f"https://congruence.dev/projects/{project.id}/settings?billing=success"
+    cancel_url = payload.cancel_url or f"https://congruence.dev/projects/{project.id}/settings?billing=cancelled"
+
+    try:
+        session = await client.create_checkout_session(
+            customer_email="admin@congruence.dev",
+            price_id=settings.stripe.price_id_pro or "price_writer_seat_monthly",
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "project_id": project.id,
+                "organization_id": org.id,
+                "seats_quantity": str(payload.quantity),
+                "purchase_type": "writer_seat",
+            },
+        )
+        return {
+            "checkout_url": session.url,
+            "session_id": session.id,
+            "quantity": payload.quantity,
+            "unit_price_usd": 49.0,
+            "total_usd": 49.0 * payload.quantity,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create checkout session: {exc!s}")
 
 
 
