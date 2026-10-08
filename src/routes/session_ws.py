@@ -6,11 +6,36 @@ import asyncio
 import json
 from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.infrastructure.auth.jwt import UserClaims, decode_jwt_token
+from src.infrastructure.auth.tenancy import lane_access
+from src.infrastructure.database.session import get_db
 from src.infrastructure.runner.registry import get_runner
 
 router = APIRouter(prefix="/ws", tags=["Session WebSocket"])
+
+
+def _extract_ws_token(websocket: WebSocket) -> str | None:
+    """Read a bearer token from the query string or Authorization header."""
+    token = websocket.query_params.get("token")
+    if token:
+        return token
+    auth_header = websocket.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return None
+
+
+async def _ws_user_or_none(websocket: WebSocket) -> UserClaims | None:
+    token = _extract_ws_token(websocket)
+    if not token:
+        return None
+    try:
+        return decode_jwt_token(token)
+    except Exception:
+        return None
 
 
 class SessionConnectionManager:
@@ -54,8 +79,29 @@ manager = SessionConnectionManager()
 
 
 @router.websocket("/session/{session_id}")
-async def session_websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
-    """Unified bidirectional session gateway multiplexing PTY, lease control, and runner events."""
+async def session_websocket_endpoint(
+    websocket: WebSocket,
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Unified bidirectional session gateway multiplexing PTY, lease control, and runner events.
+
+    Tenancy: the connection must present a valid bearer token, and the
+    session's lane (``sess_{lane_id}``) must resolve to a project the caller
+    is a member of. Unknown lanes carry no tenant resource and only require
+    authentication.
+    """
+    user = await _ws_user_or_none(websocket)
+    if user is None:
+        await websocket.close(code=4401, reason="Authentication required")
+        return
+
+    session_lane = session_id.removeprefix("sess_")
+    access = await lane_access(db, user, session_lane)
+    if access is False:
+        await websocket.close(code=4403, reason="Forbidden")
+        return
+
     await manager.connect(session_id, websocket)
     runner = get_runner()
     tasks: list[asyncio.Task] = []
@@ -81,6 +127,17 @@ async def session_websocket_endpoint(websocket: WebSocket, session_id: str) -> N
                 continue
 
             msg_type = msg.get("type")
+
+            # Cross-lane tenancy: every lane-scoped message must reference a
+            # lane the caller can access (unknown lanes carry no tenant data).
+            msg_lane = msg.get("lane_id")
+            if msg_lane:
+                lane_ok = await lane_access(db, user, msg_lane)
+                if lane_ok is False:
+                    await websocket.send_text(
+                        json.dumps({"type": "error", "detail": "Lane not found"})
+                    )
+                    continue
 
             # 1. PTY Spawning
             if msg_type == "spawn_pty":

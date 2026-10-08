@@ -17,9 +17,14 @@ _jwks_client: jwt.PyJWKClient | None = None
 
 
 def get_jwks_client() -> jwt.PyJWKClient | None:
-    """Return PyJWKClient for Clerk JWKS verification if configured."""
+    """Return PyJWKClient for Clerk JWKS verification if configured.
+
+    The URL comes from settings first: pydantic-settings reads ``.env`` but
+    does not populate ``os.environ``, so a bare ``os.getenv`` never saw it
+    and RS256 Clerk tokens silently fell through to the HS256 fallback.
+    """
     global _jwks_client
-    jwks_url = os.getenv("CLERK_JWKS_URL")
+    jwks_url = settings.auth.clerk_jwks_url or os.getenv("CLERK_JWKS_URL")
     if jwks_url and _jwks_client is None:
         try:
             _jwks_client = jwt.PyJWKClient(jwks_url)
@@ -44,9 +49,10 @@ class UserClaims:
 def decode_jwt_token(token: str) -> UserClaims:
     """Decode and verify Clerk JWKS / standard JWT token.
 
-    Supports development mock tokens (mock_user_123) when DEBUG=true.
+    Development mock tokens (mock_user_123) are only accepted when
+    ``ALLOW_DEV_TOKENS`` is explicitly enabled.
     """
-    if settings.debug and token.startswith(("mock_", "test_")):
+    if settings.auth.allow_dev_tokens and token.startswith(("mock_", "test_")):
         mock_uid = token.replace("mock_", "").replace("test_", "") or "dev_user_001"
         return UserClaims(
             user_id=mock_uid,
@@ -56,6 +62,12 @@ def decode_jwt_token(token: str) -> UserClaims:
         )
 
     payload: dict[str, Any] | None = None
+
+    header_alg = ""
+    try:
+        header_alg = jwt.get_unverified_header(token).get("alg", "")
+    except Exception:
+        header_alg = ""
 
     # 1. Attempt Clerk RS256 verification if JWKS client is available
     jwks_client = get_jwks_client()
@@ -77,10 +89,25 @@ def decode_jwt_token(token: str) -> UserClaims:
             payload = jwt.decode(
                 token,
                 settings.auth.supabase_jwt_secret,
-                algorithms=["HS256", "RS256"],
+                algorithms=["HS256"],
                 options={"verify_aud": False},
             )
         except jwt.PyJWTError as exc:
+            if header_alg == "RS256":
+                # An RS256 token can only be verified against the provider
+                # JWKS — feeding the HMAC secret to PyJWT makes it try to
+                # parse that secret as an RSA public key ("Could not parse
+                # the provided public key").
+                if jwks_client is None:
+                    logger.warning("rs256_token_without_jwks")
+                    raise ValueError(
+                        "Invalid token: RS256 signature requires Clerk JWKS "
+                        "verification (CLERK_JWKS_URL missing or unreachable)"
+                    ) from exc
+                logger.warning("rs256_signature_verification_failed", error=str(exc))
+                raise ValueError(
+                    "Invalid token: RS256 signature verification failed"
+                ) from exc
             logger.warning("jwt_verification_failed", error=str(exc))
             raise ValueError(f"Invalid token: {exc}") from exc
 

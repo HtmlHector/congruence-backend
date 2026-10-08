@@ -9,7 +9,9 @@ from src.main import app
 
 def test_websocket_session_handshake_and_lease():
     client = TestClient(app)
-    with client.websocket_connect("/ws/session/sess_test_handshake") as ws:
+    with client.websocket_connect(
+        "/ws/session/sess_test_handshake?token=mock_ws_user"
+    ) as ws:
         # Handshake ACK
         handshake_raw = ws.receive_text()
         handshake = json.loads(handshake_raw)
@@ -49,7 +51,7 @@ def test_websocket_session_handshake_and_lease():
 
 def test_websocket_sleep_wake_and_dev_server():
     client = TestClient(app)
-    with client.websocket_connect("/ws/session/sess_test_dev") as ws:
+    with client.websocket_connect("/ws/session/sess_test_dev?token=mock_ws_user") as ws:
         # Consume handshake
         _ = ws.receive_text()
 

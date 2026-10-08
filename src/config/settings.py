@@ -61,6 +61,18 @@ class AuthSettings(BaseSettings):
         default="pb_live_",
         validation_alias=AliasChoices("api_key_prefix", "AUTH_API_KEY_PREFIX"),
     )
+    # Dev-only backdoor: accepts mock_*/test_* bearer tokens as authenticated
+    # identities. Must be explicitly enabled; never on in production.
+    allow_dev_tokens: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("allow_dev_tokens", "ALLOW_DEV_TOKENS"),
+    )
+    # Clerk JSON Web Key Set endpoint for verifying RS256 session tokens.
+    # Read via settings (not os.getenv) so values in .env are actually seen.
+    clerk_jwks_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("clerk_jwks_url", "CLERK_JWKS_URL"),
+    )
 
 
 class StripeSettings(BaseSettings):

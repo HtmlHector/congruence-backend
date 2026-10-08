@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
+# Must be set before src.config.settings is imported: tests exercise the mock
+# bearer-token path (mock_*), which is disabled by default so it can never be
+# used outside explicitly-enabled development/test environments.
+os.environ.setdefault("ALLOW_DEV_TOKENS", "true")
+
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
