@@ -36,6 +36,7 @@ from src.contexts.congruence.models import (
 )
 from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.harness_login import (
+    LOGIN_BLOCKERS,
     SUPPORTED_HARNESSES,
     HarnessLoginError,
     build_login_command,
@@ -61,7 +62,7 @@ HARNESS_LABELS = {
 
 
 class StartLoginRequest(BaseModel):
-    harness: str = Field(..., pattern="^(claude|codex|antigravity)$")
+    harness: str = Field(..., pattern="^(claude|codex|antigravity|opencode)$")
 
 
 class ConnectPATRequest(BaseModel):
@@ -386,6 +387,8 @@ async def get_integrations_status(
                 "credential_path": credential_path(name),
                 "supports_login": name in SUPPORTED_HARNESSES,
                 "flow": login_flow(name) if name in SUPPORTED_HARNESSES else None,
+                # Why sign-in cannot be relayed, when it cannot.
+                "note": None if name in SUPPORTED_HARNESSES else LOGIN_BLOCKERS.get(name),
             }
             for name in HARNESS_LABELS
         },
@@ -469,6 +472,13 @@ async def start_harness_login(
             "authorization URL in the session terminal; open it on any device and "
             "paste the code back into the session. Congruence never receives "
             "the credential; the CLI writes it to the host's OS keyring."
+        )
+    elif flow == "interactive":
+        note = (
+            "Runs the vendor's own sign-in inside the session terminal; pick your "
+            "provider and follow its prompts. Any vendor authorize link passes "
+            "through the session output unmodified. Congruence never receives "
+            "the credential."
         )
     else:
         note = (

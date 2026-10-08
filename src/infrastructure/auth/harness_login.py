@@ -47,19 +47,37 @@ LOGIN_COMMANDS: dict[str, list[str]] = {
     # one-time authorization URL and waits for the user to paste the browser
     # code back into the PTY.
     "antigravity": ["agy"],
+    # OpenCode's sign-in is an interactive provider picker inside the TUI;
+    # any vendor authorize link it prints passes through the PTY unmodified.
+    "opencode": ["opencode", "auth", "login"],
 }
 
 SUPPORTED_HARNESSES = tuple(LOGIN_COMMANDS)
+
+# Harnesses with no vendor-native sign-in to relay. Aider is driven entirely
+# by API keys supplied through the host environment or a ``.env`` file
+# (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``OPENROUTER_API_KEY``, ...); there
+# is no interactive login to run, so the Vault is the intended path for getting
+# keys into the host's environment without exposing them to us.
+LOGIN_BLOCKERS: dict[str, str] = {
+    "aider": (
+        "Aider has no vendor sign-in flow; it reads API keys from the host "
+        "environment or a .env file. Provide keys via the Vault instead."
+    ),
+}
 
 # How each harness surfaces its sign-in step to the browser.
 # * ``loopback_bridge`` — the CLI binds a loopback callback port that we
 #   publish as a private service URL (see CALLBACK_PORTS).
 # * ``url_paste`` — the CLI prints a one-time authorization URL on the PTY and
 #   the user pastes the browser's code back into the session terminal.
+# * ``interactive`` — the user drives the vendor's own picker in the session
+#   terminal; any authorize link passes through the PTY unmodified.
 LOGIN_FLOWS: dict[str, str] = {
     "claude": "loopback_bridge",
     "codex": "loopback_bridge",
     "antigravity": "url_paste",
+    "opencode": "interactive",
 }
 
 
@@ -75,6 +93,7 @@ CREDENTIAL_PATHS: dict[str, str] = {
     # there is no credential path to read or delete. The CLI home directory is
     # the presence marker the host can check instead.
     "antigravity": "~/.gemini/antigravity-cli/",
+    "opencode": "~/.local/share/opencode/auth.json",
 }
 
 # Where the CLI prints its authorize URL. Matched only so we can surface a

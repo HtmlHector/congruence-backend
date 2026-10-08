@@ -18,6 +18,7 @@ import pytest
 from src.contexts.congruence.models import HarnessAuth
 from src.infrastructure.auth.harness_login import (
     CALLBACK_PORTS,
+    LOGIN_BLOCKERS,
     SUPPORTED_HARNESSES,
     HarnessLoginError,
     LoginSessionRegistry,
@@ -37,12 +38,18 @@ def test_login_command_uses_vendor_cli() -> None:
     # triggers its remote OAuth sign-in flow.
     assert build_login_command("antigravity") == ["agy"]
     assert "antigravity" in SUPPORTED_HARNESSES
+    # OpenCode's sign-in is its interactive provider picker.
+    assert build_login_command("opencode") == ["opencode", "auth", "login"]
+    assert "opencode" in SUPPORTED_HARNESSES
 
 
 def test_unsupported_harness_is_rejected() -> None:
+    # Aider has no vendor sign-in to relay: it is API-key driven via the host
+    # environment, so there is no login command we could honestly define.
     with pytest.raises(HarnessLoginError) as exc:
-        build_login_command("opencode")
+        build_login_command("aider")
     assert exc.value.code == "unsupported_harness"
+    assert "aider" in LOGIN_BLOCKERS
 
 
 def test_callback_ports_are_allowlisted() -> None:
@@ -150,6 +157,7 @@ def test_login_flow_matches_harness_signin_style() -> None:
     assert login_flow("claude") == "loopback_bridge"
     assert login_flow("codex") == "loopback_bridge"
     assert login_flow("antigravity") == "url_paste"
+    assert login_flow("opencode") == "interactive"
 
 
 def test_antigravity_login_session_uses_registry() -> None:
@@ -168,4 +176,5 @@ def test_credential_paths_are_host_side_only() -> None:
     # Antigravity keeps its token in the OS keyring; the CLI home directory is
     # only a presence marker, never a credential we can read or restore.
     assert credential_path("antigravity") == "~/.gemini/antigravity-cli/"
+    assert credential_path("opencode") == "~/.local/share/opencode/auth.json"
     assert credential_path("aider") is None
