@@ -325,3 +325,21 @@ class ActivityEvent(Base):
 
     project: Mapped[Project] = relationship("Project", back_populates="activity_events")
 
+
+class ChatSession(Base, TimestampMixin):
+    __tablename__ = "congruence_chat_sessions"
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=lambda: generate_id("chat")
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("congruence_projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    lane_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    harness: Mapped[str] = mapped_column(String(64), default="Antigravity", nullable=False)
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), default="idle", nullable=False)
+    messages_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+

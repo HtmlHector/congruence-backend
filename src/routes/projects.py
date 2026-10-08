@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.contexts.congruence.models import (
     ActivityEvent,
     Actor,
+    ChatSession,
     GitHubAccount,
     Grant,
     Host,
@@ -34,6 +35,7 @@ class CreateProjectRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     slug: str = Field(..., min_length=1, max_length=64)
     repo_full_name: str = Field(..., min_length=1, max_length=255)
+    repo_url: str | None = None
     default_branch: str = Field("main", max_length=64)
     visibility: str = Field("private", pattern="^(private|public)$")
 
@@ -80,9 +82,12 @@ async def create_project(
     db.add(project)
     await db.flush()
 
-    # Provision host
+    # Provision host with git repo cloning
     runner = get_runner()
-    host_info = await runner.create_host(project.id)
+    host_info = await runner.create_host(
+        project.id,
+        repo_url=payload.repo_url or (f"https://github.com/{payload.repo_full_name}.git" if payload.repo_full_name else None)
+    )
     host = Host(
         id=host_info.host_id,
         project_id=project.id,
@@ -295,6 +300,68 @@ async def get_git_status(project_id: str, lane_id: str | None = None, db: AsyncS
         "deletions": diff_info.deletions,
         "diff_text": diff_info.diff_text
     }
+
+@router.get("/{project_id}/lanes/{lane_id}/files")
+async def get_lane_files(
+    project_id: str,
+    lane_id: str,
+    subpath: str = Query("", description="Relative subpath in worktree"),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Get live hierarchical filesystem tree for the worktree lane."""
+    runner = get_runner()
+    return await runner.list_lane_files(lane_id, subpath=subpath)
+
+
+
+@router.get("/{project_id}/lanes/{lane_id}/file-content")
+async def get_lane_file_content(
+    project_id: str,
+    lane_id: str,
+    path: str = Query(..., description="File path relative to worktree root"),
+    encoding: str = Query("utf-8", description="'utf-8' for text, 'base64' for binary"),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Read content of a file in the worktree lane.
+    
+    When encoding=base64, the file is read as binary and returned as a base64 string.
+    This is used for image files that cannot be decoded as UTF-8 text.
+    """
+    runner = get_runner()
+    try:
+        if encoding == "base64":
+            content, size = await runner.read_lane_file_b64(lane_id, file_path=path)
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            return {"path": path, "content": content, "encoding": "base64", "extension": ext, "size": size}
+        content = await runner.read_lane_file(lane_id, file_path=path)
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        return {"path": path, "content": content, "extension": ext, "size": len(content.encode("utf-8"))}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class WriteLaneFileRequest(BaseModel):
+    path: str
+    content: str
+
+
+@router.post("/{project_id}/lanes/{lane_id}/files")
+async def write_lane_file(
+    project_id: str,
+    lane_id: str,
+    payload: WriteLaneFileRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Write text content to a file in the worktree lane."""
+    runner = get_runner()
+    try:
+        await runner.write_lane_file(lane_id, file_path=payload.path, content=payload.content)
+        return {"status": "ok", "path": payload.path}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.get("")
 async def list_projects(db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
@@ -813,5 +880,147 @@ async def get_project_activity(
         }
         for e in events
     ]
+
+
+class ChatSessionPayload(BaseModel):
+    id: str | None = None
+    lane_id: str
+    title: str
+    harness: str = "Antigravity"
+    model: str | None = None
+    state: str = "idle"
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.get("/{project_id}/chats")
+async def get_project_chats(
+    project_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    """Retrieve all saved chat sessions and histories for a project."""
+    import json
+    result = await db.execute(
+        select(ChatSession)
+        .where(ChatSession.project_id == project_id)
+        .order_by(ChatSession.created_at.asc())
+    )
+    chats = result.scalars().all()
+    out = []
+    for c in chats:
+        try:
+            msgs = json.loads(c.messages_json or "[]")
+        except Exception:
+            msgs = []
+        out.append(
+            {
+                "id": c.id,
+                "lane_id": c.lane_id,
+                "title": c.title,
+                "harness": c.harness,
+                "model": c.model,
+                "state": c.state,
+                "messages": msgs,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+        )
+    return out
+
+
+@router.post("/{project_id}/chats")
+async def save_project_chat(
+    project_id: str,
+    payload: ChatSessionPayload,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Create or update a chat session with full message history."""
+    import json
+    import uuid
+    from sqlalchemy.exc import IntegrityError
+
+    msgs_str = json.dumps(payload.messages)
+
+    if payload.id:
+        existing = await db.execute(
+            select(ChatSession).where(ChatSession.id == payload.id)
+        )
+        chat = existing.scalar_one_or_none()
+        if chat:
+            chat.project_id = project_id
+            chat.lane_id = payload.lane_id or chat.lane_id
+            chat.title = payload.title
+            chat.harness = payload.harness
+            chat.model = payload.model
+            chat.state = payload.state
+            chat.messages_json = msgs_str
+            await db.commit()
+            return {"status": "updated", "id": chat.id}
+
+    chat_id = payload.id if payload.id else f"chat-{uuid.uuid4().hex[:12]}"
+    new_chat = ChatSession(
+        id=chat_id,
+        project_id=project_id,
+        lane_id=payload.lane_id,
+        title=payload.title,
+        harness=payload.harness,
+        model=payload.model,
+        state=payload.state,
+        messages_json=msgs_str,
+    )
+    db.add(new_chat)
+    try:
+        await db.commit()
+        return {"status": "created", "id": new_chat.id}
+    except IntegrityError:
+        await db.rollback()
+        # Concurrent insert occurred, update the existing row safely
+        existing = await db.execute(
+            select(ChatSession).where(ChatSession.id == chat_id)
+        )
+        chat = existing.scalar_one_or_none()
+        if chat:
+            chat.project_id = project_id
+            chat.lane_id = payload.lane_id or chat.lane_id
+            chat.title = payload.title
+            chat.harness = payload.harness
+            chat.model = payload.model
+            chat.state = payload.state
+            chat.messages_json = msgs_str
+            await db.commit()
+            return {"status": "updated", "id": chat.id}
+        raise
+
+
+@router.delete("/{project_id}/chats/{chat_id}")
+async def delete_project_chat(
+    project_id: str,
+    chat_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Delete a chat session."""
+    existing = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == chat_id, ChatSession.project_id == project_id
+        )
+    )
+    chat = existing.scalar_one_or_none()
+    if chat:
+        await db.delete(chat)
+        await db.commit()
+        return {"status": "deleted", "id": chat_id}
+    return {"status": "not_found", "id": chat_id}
+
+
+@router.post("/{project_id}/lanes/{lane_id}/merge")
+async def merge_lane_endpoint(
+    project_id: str,
+    lane_id: str,
+    target_branch: str = "main",
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """1-Click merge a lane's isolated branch into main/pair branch with conflict checking."""
+    runner = get_runner()
+    res = await runner.merge_lane(lane_id, target_branch=target_branch)
+    return res
+
 
 

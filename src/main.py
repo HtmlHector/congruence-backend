@@ -51,43 +51,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             else:
                 await conn.run_sync(Base.metadata.create_all)
 
-        async with AsyncSessionFactory() as session:
-            roles = [
-                ("OWNER", "Full workspace control", ["*"]),
-                (
-                    "ADMIN",
-                    "Administrative access",
-                    [
-                        "workspace:read",
-                        "workspace:write",
-                        "member:read",
-                        "member:write",
-                        "apikey:*",
-                        "billing:read",
-                        "agent:*",
-                    ],
-                ),
-                (
-                    "MEMBER",
-                    "Standard member access",
-                    ["workspace:read", "agent:chat", "agent:action", "apikey:read"],
-                ),
-                ("VIEWER", "Read-only access", ["workspace:read"]),
-            ]
-            for name, desc, perms in roles:
-                await session.execute(
-                    text(
-                        """
-                        INSERT INTO identity.roles (role_id, name, description, is_system, permissions)
-                        VALUES (gen_random_uuid(), :name, :desc, TRUE, :perms)
-                        ON CONFLICT (name, workspace_id) DO UPDATE SET
-                            description = EXCLUDED.description,
-                            permissions = EXCLUDED.permissions
-                        """
+        if not is_sqlite:
+            async with AsyncSessionFactory() as session:
+                roles = [
+                    ("OWNER", "Full workspace control", ["*"]),
+                    (
+                        "ADMIN",
+                        "Administrative access",
+                        [
+                            "workspace:read",
+                            "workspace:write",
+                            "member:read",
+                            "member:write",
+                            "apikey:*",
+                            "billing:read",
+                            "agent:*",
+                        ],
                     ),
-                    {"name": name, "desc": desc, "perms": perms},
-                )
-            await session.commit()
+                    (
+                        "MEMBER",
+                        "Standard member access",
+                        ["workspace:read", "agent:chat", "agent:action", "apikey:read"],
+                    ),
+                    ("VIEWER", "Read-only access", ["workspace:read"]),
+                ]
+                for name, desc, perms in roles:
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO identity.roles (role_id, name, description, is_system, permissions)
+                            VALUES (gen_random_uuid(), :name, :desc, TRUE, :perms)
+                            ON CONFLICT (name, workspace_id) DO UPDATE SET
+                                description = EXCLUDED.description,
+                                permissions = EXCLUDED.permissions
+                            """
+                        ),
+                        {"name": name, "desc": desc, "perms": perms},
+                    )
+                await session.commit()
     except Exception as exc:
         logger.warning("roles_seed_skipped", detail=str(exc))
 
@@ -129,6 +130,9 @@ def create_app() -> FastAPI:
     app.include_router(agents_router, prefix="/api/v1")
 
     # Real-time WebSocket Gateway & Dev Preview Proxy
+    app.include_router(projects_router)
+    app.include_router(integrations_router)
+    app.include_router(agents_router)
     app.include_router(session_ws_router)
     app.include_router(session_ws_router, prefix="/api/v1")
     app.include_router(proxy_router)

@@ -61,6 +61,7 @@ class MockAsyncSession:
         self.commit = AsyncMock()
         self.rollback = AsyncMock()
         self.flush = AsyncMock()
+        self.refresh = AsyncMock()
 
     def add(self, instance):
         pass

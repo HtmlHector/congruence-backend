@@ -42,6 +42,52 @@ class ExecuteToolRequest(BaseModel):
     tool_args: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentChatStreamRequest(BaseModel):
+    prompt: str
+    harness: str = "Antigravity"
+    model: str | None = None
+    project_id: str | None = None
+    lane_id: str | None = None
+    branch: str | None = None
+    cwd: str | None = None
+    chat_id: str | None = None
+
+
+@router.post("/chat/stream")
+async def stream_agent_chat(
+    req: AgentChatStreamRequest,
+):
+    """Execute host-custody agent CLI (Antigravity, Claude Code, Codex, Shell)
+    and stream SSE events directly to the frontend chat UI.
+    """
+    import json
+    from fastapi.responses import StreamingResponse
+    from src.infrastructure.runners.agent_runner import run_agent_stream
+
+    async def event_generator():
+        async for event in run_agent_stream(
+            harness=req.harness,
+            prompt=req.prompt,
+            cwd=req.cwd,
+            model=req.model,
+            project_id=req.project_id,
+            lane_id=req.lane_id,
+            branch=req.branch,
+            chat_id=req.chat_id,
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/execute-tool")
 async def execute_tool(
     req: ExecuteToolRequest,
@@ -62,3 +108,4 @@ async def execute_tool(
         raise HTTPException(status_code=404, detail=f"Tool '{req.tool_name}' not found") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Tool execution failed: {exc}") from exc
+

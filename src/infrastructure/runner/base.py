@@ -53,7 +53,9 @@ class HostBackend(ABC):
     """Abstract interface for microVM/container/process runner environments."""
 
     @abstractmethod
-    async def create_host(self, project_id: str, size: str = "standard") -> HostInfo:
+    async def create_host(
+        self, project_id: str, size: str = "standard", repo_url: str | None = None
+    ) -> HostInfo:
         """Provision a persistent runner instance."""
         ...
 
@@ -126,4 +128,19 @@ class HostBackend(ABC):
     @abstractmethod
     async def get_diff(self, lane_id: str) -> GitDiffInfo:
         """Get live git diff for lane worktree against base branch."""
+        ...
+
+    @abstractmethod
+    async def list_lane_files(self, lane_id: str, subpath: str = "") -> dict[str, Any]:
+        """List live hierarchical filesystem tree for the lane's worktree."""
+        ...
+
+    @abstractmethod
+    async def read_lane_file(self, lane_id: str, file_path: str) -> str:
+        """Read text content of a file in the lane's worktree."""
+        ...
+
+    @abstractmethod
+    async def write_lane_file(self, lane_id: str, file_path: str, content: str) -> None:
+        """Write text content to a file in the lane's worktree."""
         ...

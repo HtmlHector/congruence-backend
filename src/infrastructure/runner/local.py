@@ -9,6 +9,7 @@ import pty
 import struct
 import tempfile
 import termios
+from pathlib import Path
 from collections.abc import AsyncGenerator
 
 from src.infrastructure.runner.base import (
@@ -43,7 +44,9 @@ class LocalProcessRunner(HostBackend):
         self._dev_servers: dict[str, asyncio.subprocess.Process] = {}
         self._dev_server_info: dict[str, DevServerInfo] = {}
 
-    async def create_host(self, project_id: str, size: str = "standard") -> HostInfo:
+    async def create_host(
+        self, project_id: str, size: str = "standard", repo_url: str | None = None
+    ) -> HostInfo:
         import nanoid
         host_id = f"host_{nanoid.generate(size=12)}"
         host_dir = os.path.join(self.base_workdir, host_id)
@@ -53,12 +56,76 @@ class LocalProcessRunner(HostBackend):
         repo_dir = os.path.join(host_dir, "repo")
         os.makedirs(repo_dir, exist_ok=True)
         
-        proc = await asyncio.create_subprocess_exec(
-            "git", "init", "-b", "main", repo_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
+        cloned_successfully = False
+        if repo_url and repo_url.strip():
+            url = repo_url.strip()
+            if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("git@"):
+                url = f"https://github.com/{url}.git"
+            
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "clone", url, repo_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                if proc.returncode == 0:
+                    cloned_successfully = True
+            except Exception:
+                pass
+        
+        if not cloned_successfully and not os.path.exists(os.path.join(repo_dir, ".git")):
+            import shutil
+            local_candidates = []
+            if project_id:
+                local_candidates.extend([
+                    os.path.expanduser(f"~/.congruence/projects/{project_id}"),
+                    os.path.expanduser(f"~/.congruence/projects/{project_id.replace('proj-', '')}"),
+                ])
+                if "meridian" in project_id.lower():
+                    local_candidates.append(os.path.expanduser("~/.congruence/projects/meridian-api"))
+            if repo_url and "meridian" in repo_url.lower():
+                local_candidates.append(os.path.expanduser("~/.congruence/projects/meridian-api"))
+
+            for lp in local_candidates:
+                if os.path.isdir(lp) and os.listdir(lp):
+                    try:
+                        shutil.copytree(lp, repo_dir, dirs_exist_ok=True)
+                        break
+                    except Exception:
+                        pass
+
+            if not os.path.exists(os.path.join(repo_dir, ".git")):
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "init", "-b", "main", repo_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+
+        # Ensure at least one commit exists in the repo so worktrees can branch off HEAD
+        try:
+            commit_check = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", "HEAD",
+                cwd=repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await commit_check.communicate()
+            if commit_check.returncode != 0:
+                readme_path = os.path.join(repo_dir, "README.md")
+                if not os.path.exists(readme_path):
+                    with open(readme_path, "w", encoding="utf-8") as f:
+                        f.write(f"# {project_id}\n\nInitialized in Congruence workspace.\n")
+                
+                await asyncio.create_subprocess_exec("git", "config", "user.name", "Congruence Host", cwd=repo_dir)
+                await asyncio.create_subprocess_exec("git", "config", "user.email", "host@congruence.dev", cwd=repo_dir)
+                p_add = await asyncio.create_subprocess_exec("git", "add", ".", cwd=repo_dir)
+                await p_add.communicate()
+                p_comm = await asyncio.create_subprocess_exec("git", "commit", "-m", "Initial workspace commit", cwd=repo_dir)
+                await p_comm.communicate()
+        except Exception:
+            pass
 
         info = HostInfo(
             host_id=host_id,
@@ -293,17 +360,80 @@ class LocalProcessRunner(HostBackend):
         import fcntl
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
 
+        # Generate sandbox jail configuration to lock shell traversal to worktree
+        sandbox_dir = Path.home() / ".congruence" / "sandboxes" / lane_id
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+        
+        jail_script = f"""# Congruence Worktree Sandbox Jail
+export CONGRUENCE_WORKTREE_ROOT="{cwd}"
+export WORKTREE_ROOT="{cwd}"
+export HOME="{cwd}"
+export PWD="{cwd}"
+
+# Guard directory changes to prevent escaping the worktree jail
+cd() {{
+  local target="${{1:-$CONGRUENCE_WORKTREE_ROOT}}"
+  if [ "$target" = "~" ] || [ -z "$1" ]; then
+    target="$CONGRUENCE_WORKTREE_ROOT"
+  fi
+  local dest=$(python3 -c "import os, sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))" "$target" 2>/dev/null || echo "$target")
+  
+  case "$dest" in
+    "$CONGRUENCE_WORKTREE_ROOT"*)
+      builtin cd "$dest"
+      ;;
+    *)
+      printf "\\033[1;33m🔒 [Congruence Sandbox]\\033[0m Directory traversal blocked: '%s' is outside this worktree.\\n" "$dest"
+      printf "\\033[0;90m   Lane worktree: %s\\033[0m\\n" "$CONGRUENCE_WORKTREE_ROOT"
+      builtin cd "$CONGRUENCE_WORKTREE_ROOT"
+      ;;
+  esac
+}}
+
+pushd() {{
+  if [ -z "$1" ]; then
+    builtin pushd
+    return
+  fi
+  local dest=$(python3 -c "import os, sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))" "$1" 2>/dev/null || echo "$1")
+  case "$dest" in
+    "$CONGRUENCE_WORKTREE_ROOT"*)
+      builtin pushd "$dest"
+      ;;
+    *)
+      printf "\\033[1;33m🔒 [Congruence Sandbox]\\033[0m Directory traversal blocked: '%s' is outside this worktree.\\n" "$dest"
+      ;;
+  esac
+}}
+
+# Clean prompt with worktree badge
+if [ -n "$ZSH_VERSION" ]; then
+  PROMPT="%F{{cyan}}➜ %F{{green}}%~%F{{yellow}} [worktree] %F{{reset}}%% "
+else
+  PS1="\\[\\033[01;32m\\]\\w [worktree] \\$ \\[\\033[00m\\]"
+fi
+"""
+        (sandbox_dir / ".zshrc").write_text(jail_script)
+        (sandbox_dir / ".bashrc").write_text(jail_script)
+        (sandbox_dir / ".profile").write_text(jail_script)
+
         if isinstance(command, list):
             cmd_args = command
-        elif command in ("/bin/sh", "/bin/zsh", "/bin/bash", "sh", "zsh", "bash"):
+        elif command in ("/bin/bash", "bash"):
+            cmd_args = ["/bin/bash", "--rcfile", str(sandbox_dir / ".bashrc"), "-i"]
+        elif command in ("/bin/sh", "/bin/zsh", "sh", "zsh"):
             cmd_args = [command, "-i"]
         else:
             cmd_args = ["/bin/sh", "-c", command]
 
-
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
+        merged_env["HOME"] = cwd
+        merged_env["CONGRUENCE_WORKTREE_ROOT"] = cwd
+        merged_env["ZDOTDIR"] = str(sandbox_dir)
+        merged_env["BASH_ENV"] = str(sandbox_dir / ".bashrc")
+        merged_env["ENV"] = str(sandbox_dir / ".profile")
         merged_env["TERM"] = "xterm-256color"
         merged_env["COLORTERM"] = "truecolor"
 
@@ -491,3 +621,155 @@ class LocalProcessRunner(HostBackend):
             deletions=0,
             diff_text=diff_text,
         )
+
+    async def list_lane_files(self, lane_id: str, subpath: str = "") -> dict[str, Any]:
+        lane_cwd = await self.resolve_lane_cwd(lane_id)
+        target_dir = os.path.join(lane_cwd, subpath.lstrip("/")) if subpath else lane_cwd
+        if not os.path.exists(target_dir):
+            return {"tree": [], "path": subpath, "root": lane_cwd}
+
+        IGNORED_NAMES = {".git", ".next", "node_modules", ".turbo", ".DS_Store", "__pycache__", ".venv"}
+
+        def build_tree(current_path: str, rel_prefix: str = "") -> list[dict[str, Any]]:
+            try:
+                entries = sorted(os.scandir(current_path), key=lambda e: (not e.is_dir(), e.name.lower()))
+            except Exception:
+                return []
+            
+            nodes = []
+            for entry in entries:
+                if entry.name in IGNORED_NAMES or (entry.name.startswith(".") and entry.name != ".env.example"):
+                    continue
+                rel_path = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    nodes.append({
+                        "name": entry.name,
+                        "path": rel_path,
+                        "type": "directory",
+                        "children": build_tree(entry.path, rel_path),
+                    })
+                else:
+                    ext = os.path.splitext(entry.name)[1].lstrip(".")
+                    size = 0
+                    try:
+                        size = entry.stat().st_size
+                    except Exception:
+                        pass
+                    nodes.append({
+                        "name": entry.name,
+                        "path": rel_path,
+                        "type": "file",
+                        "size": size,
+                        "extension": ext,
+                    })
+            return nodes
+
+        tree = build_tree(target_dir, subpath.strip("/"))
+        return {"tree": tree, "path": subpath, "root": lane_cwd}
+
+    async def read_lane_file(self, lane_id: str, file_path: str) -> str:
+        lane_cwd = await self.resolve_lane_cwd(lane_id)
+        full_path = os.path.abspath(os.path.join(lane_cwd, file_path.lstrip("/")))
+        if not full_path.startswith(os.path.abspath(lane_cwd)):
+            raise ValueError("Path traversal forbidden")
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    async def read_lane_file_b64(self, lane_id: str, file_path: str) -> tuple[str, int]:
+        """Read a file as binary and return (base64_string, file_size_bytes).
+        
+        Used for image and other binary files that cannot be decoded as UTF-8 text.
+        """
+        import base64
+        lane_cwd = await self.resolve_lane_cwd(lane_id)
+        full_path = os.path.abspath(os.path.join(lane_cwd, file_path.lstrip("/")))
+        if not full_path.startswith(os.path.abspath(lane_cwd)):
+            raise ValueError("Path traversal forbidden")
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        with open(full_path, "rb") as f:
+            data = f.read()
+        return base64.b64encode(data).decode("ascii"), len(data)
+
+
+    async def write_lane_file(self, lane_id: str, file_path: str, content: str) -> None:
+        lane_cwd = await self.resolve_lane_cwd(lane_id)
+        full_path = os.path.abspath(os.path.join(lane_cwd, file_path.lstrip("/")))
+        if not full_path.startswith(os.path.abspath(lane_cwd)):
+            raise ValueError("Path traversal forbidden")
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    async def merge_lane(self, lane_id: str, target_branch: str = "main") -> dict[str, Any]:
+        """Merge a lane's branch into target branch with automatic commit & conflict detection."""
+        cwd = await self.resolve_lane_cwd(lane_id)
+        branch_name = "main"
+        if lane_id in self._lanes:
+            branch_name = self._lanes[lane_id].branch_name
+        else:
+            try:
+                from sqlalchemy import select
+                from src.contexts.congruence.models import Lane
+                from src.infrastructure.database.session import AsyncSessionFactory
+                async with AsyncSessionFactory() as session:
+                    l = (await session.execute(select(Lane).where(Lane.id == lane_id))).scalar_one_or_none()
+                    if l:
+                        branch_name = l.branch_name
+            except Exception:
+                pass
+
+        # Ensure WIP changes in lane are committed
+        proc_status = await asyncio.create_subprocess_exec(
+            "git", "status", "--porcelain",
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        status_out, _ = await proc_status.communicate()
+        if status_out.strip():
+            await asyncio.create_subprocess_exec(
+                "git", "add", ".",
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.create_subprocess_exec(
+                "git", "-c", "user.name=Congruence", "-c", "user.email=bot@congruence.dev",
+                "commit", "-m", f"Auto-commit before merge from {branch_name}",
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+        # Merge branch into repo/main
+        host_dir = os.path.dirname(cwd)
+        repo_root = os.path.join(host_dir, "repo") if os.path.exists(os.path.join(host_dir, "repo")) else cwd
+
+        proc_merge = await asyncio.create_subprocess_exec(
+            "git", "merge", branch_name, "--no-edit",
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        merge_out, merge_err = await proc_merge.communicate()
+
+        if proc_merge.returncode == 0:
+            return {
+                "success": True,
+                "status": "merged",
+                "merged_branch": branch_name,
+                "target_branch": target_branch,
+                "output": merge_out.decode("utf-8", errors="replace"),
+            }
+        else:
+            return {
+                "success": False,
+                "status": "conflict",
+                "merged_branch": branch_name,
+                "target_branch": target_branch,
+                "error": merge_err.decode("utf-8", errors="replace"),
+                "output": merge_out.decode("utf-8", errors="replace"),
+            }

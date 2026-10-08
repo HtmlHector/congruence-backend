@@ -58,6 +58,31 @@ async def test_runner_pty_interactive_stream():
 
 
 @pytest.mark.asyncio
+async def test_runner_pty_sandbox_jail_home():
+    runner = LocalProcessRunner()
+    host = await runner.create_host("proj_test_jail")
+    lane = await runner.create_lane(host.host_id, "main", is_pair_lane=True)
+    cwd = await runner.resolve_lane_cwd(lane.lane_id)
+
+    # Spawn PTY running echo of HOME and CONGRUENCE_WORKTREE_ROOT
+    pty_id = await runner.spawn_pty(
+        lane.lane_id,
+        ["/bin/sh", "-c", "echo \"JAIL_HOME=$HOME JAIL_ROOT=$CONGRUENCE_WORKTREE_ROOT\""],
+    )
+
+    output = ""
+    async for chunk in runner.read_pty_stream(pty_id):
+        output += chunk
+        if "JAIL_HOME=" in output:
+            break
+
+    assert f"JAIL_HOME={cwd}" in output
+    assert f"JAIL_ROOT={cwd}" in output
+
+    await runner.terminate_pty(pty_id)
+
+
+@pytest.mark.asyncio
 async def test_runner_dev_server_lifecycle():
     runner = LocalProcessRunner()
     host = await runner.create_host("proj_test_dev")
