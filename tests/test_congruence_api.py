@@ -4,6 +4,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from src.infrastructure.auth.dependencies import get_current_user
+from src.infrastructure.auth.jwt import UserClaims
 from src.infrastructure.database.base import Base
 from src.infrastructure.database.session import get_db, get_db_session
 from src.main import app
@@ -12,10 +14,18 @@ from src.main import app
 test_async_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
 TestSessionFactory = async_sessionmaker(test_async_engine, expire_on_commit=False)
 
+OWNER = UserClaims(user_id="usr_owner", email="owner@example.com")
+OUTSIDER = UserClaims(user_id="usr_outsider", email="outsider@example.com")
+current_test_user: dict[str, UserClaims] = {"user": OWNER}
+
 
 async def override_get_test_db():
     async with TestSessionFactory() as session:
         yield session
+
+
+def override_get_current_user() -> UserClaims:
+    return current_test_user["user"]
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +34,8 @@ async def prepare_database():
     orig_get_db_session = app.dependency_overrides.get(get_db_session)
     app.dependency_overrides[get_db] = override_get_test_db
     app.dependency_overrides[get_db_session] = override_get_test_db
+    app.dependency_overrides[get_current_user] = override_get_current_user
+    current_test_user["user"] = OWNER
 
     congruence_tables = [t for t in Base.metadata.sorted_tables if t.name.startswith("congruence_")]
     async with test_async_engine.begin() as conn:
@@ -41,6 +53,72 @@ async def prepare_database():
         app.dependency_overrides[get_db_session] = orig_get_db_session
     else:
         app.dependency_overrides.pop(get_db_session, None)
+
+    app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.mark.asyncio
+async def test_project_routes_require_authentication():
+    transport = ASGITransport(app=app)
+    app.dependency_overrides.pop(get_current_user, None)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/v1/projects")
+            assert resp.status_code == 401
+    finally:
+        app.dependency_overrides[get_current_user] = override_get_current_user
+
+
+@pytest.mark.asyncio
+async def test_projects_are_scoped_to_member_orgs():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/projects",
+            json={"name": "Owner Project", "slug": "owner-project", "repo_full_name": "acme/owner"},
+        )
+        assert created.status_code == 201
+        project_id = created.json()["id"]
+
+        listed = await client.get("/api/v1/projects")
+        assert project_id in [p["id"] for p in listed.json()]
+        assert (await client.get(f"/api/v1/projects/{project_id}")).status_code == 200
+
+        current_test_user["user"] = OUTSIDER
+        try:
+            listed = await client.get("/api/v1/projects")
+            assert listed.json() == []
+            assert (await client.get(f"/api/v1/projects/{project_id}")).status_code == 404
+            assert (await client.get(f"/api/v1/projects/{project_id}/lanes")).status_code == 404
+            assert (await client.get(f"/api/v1/projects/{project_id}/host")).status_code == 404
+        finally:
+            current_test_user["user"] = OWNER
+
+
+@pytest.mark.asyncio
+async def test_host_usage_tracks_state_and_estimates_cost():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/projects",
+            json={"name": "Usage Project", "slug": "usage-project", "repo_full_name": "acme/usage"},
+        )
+        assert created.status_code == 201
+        project_id = created.json()["id"]
+
+        usage = (await client.get(f"/api/v1/projects/{project_id}/host/usage")).json()
+        assert usage["state"] == "awake"
+        assert usage["awake_seconds_month"] >= 0
+        assert usage["rate_usd_per_hour"] == 0.15
+        assert usage["estimated_cost_usd_month"] >= 0
+
+        assert (await client.post(f"/api/v1/projects/{project_id}/host/sleep")).status_code == 200
+        usage = (await client.get(f"/api/v1/projects/{project_id}/host/usage")).json()
+        assert usage["state"] == "asleep"
+
+        assert (await client.post(f"/api/v1/projects/{project_id}/host/wake")).status_code == 200
+        usage = (await client.get(f"/api/v1/projects/{project_id}/host/usage")).json()
+        assert usage["state"] == "awake"
 
 
 @pytest.mark.asyncio
