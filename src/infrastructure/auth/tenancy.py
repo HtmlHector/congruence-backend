@@ -11,8 +11,18 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.contexts.congruence.models import Host, Lane, OrganizationMember, Project
+from src.contexts.congruence.models import (
+    Host,
+    Lane,
+    Organization,
+    OrganizationMember,
+    Project,
+    generate_id,
+)
 from src.infrastructure.auth.jwt import UserClaims
+
+
+from sqlalchemy.exc import IntegrityError
 
 
 async def user_has_project_access(
@@ -28,6 +38,7 @@ async def user_has_project_access(
         .where(Project.id == project_id, OrganizationMember.user_id == user.user_id)
     )
     return res.first() is not None
+
 
 
 async def require_project_access(

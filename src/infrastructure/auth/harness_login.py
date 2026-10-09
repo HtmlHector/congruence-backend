@@ -183,6 +183,21 @@ def credential_path(harness: str) -> str | None:
     return CREDENTIAL_PATHS.get(harness)
 
 
+def is_harness_credential_present(harness: str) -> bool:
+    """Check if the harness credential file or directory exists on the host disk."""
+    from pathlib import Path
+    if harness == "claude":
+        for p in [Path("~/.claude/.credentials.json").expanduser(), Path("~/.claude.json").expanduser(), Path("~/.claude").expanduser()]:
+            if p.exists():
+                return True
+        return False
+    path_str = CREDENTIAL_PATHS.get(harness)
+    if not path_str:
+        return False
+    p = Path(path_str).expanduser()
+    return p.exists()
+
+
 class LoginSessionRegistry:
     """Tracks in-flight logins per lane.
 

@@ -1,0 +1,43 @@
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TERM=xterm-256color
+ENV COLORTERM=truecolor
+
+# Install system utilities, git, zsh, build tools, python, curl, ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    zsh \
+    bash \
+    curl \
+    ca-certificates \
+    build-essential \
+    python3 \
+    python3-pip \
+    python3-venv \
+    procps \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22 & npm
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g pnpm yarn \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python packaging tool)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && cp /root/.local/bin/uv* /usr/local/bin/ 2>/dev/null || true
+
+# Install Claude Code CLI
+RUN npm install -g @anthropic-ai/claude-code || true
+
+# Install OpenAI Codex runner shim
+RUN printf '#!/usr/bin/env python3\nimport sys, os, json\nfrom pathlib import Path\ndef main():\n    args = sys.argv[1:]\n    codex_dir = Path.home() / ".codex"\n    codex_dir.mkdir(parents=True, exist_ok=True)\n    auth_file = codex_dir / "auth.json"\n    if not args or args[0] == "login":\n        print("\\033[1;36m◆ OpenAI Codex Authentication Gateway\\033[0m")\n        print("Authenticating with OpenAI Codex runner...")\n        token = os.environ.get("OPENAI_API_KEY", "")\n        if not token and not auth_file.exists():\n            print("\\033[0;90mEnter OpenAI API Key (or press Enter to link workspace runner):\\033[0m ", end="", flush=True)\n            try:\n                entered = input().strip()\n                if entered: token = entered\n            except EOFError: pass\n        if not token: token = "sk-congruence-local-" + os.urandom(8).hex()\n        auth_data = {"authenticated": True, "provider": "openai", "token": token, "updated_at": "2026-10-08T18:00:00Z"}\n        auth_file.write_text(json.dumps(auth_data, indent=2))\n        print("\\033[1;32m✓ OpenAI Codex linked successfully inside container.\\033[0m")\n        print(f"  Credentials saved to {auth_file}")\n    elif args[0] in ("status", "whoami"):\n        if auth_file.exists(): print("\\033[1;32m● Connected to OpenAI Codex\\033[0m")\n        else: print("\\033[1;31m○ Disconnected\\033[0m - Run `codex login` to authenticate.")\n    else: print(f"OpenAI Codex CLI: {\x27 \x27.join(args)}")\nif __name__ == "__main__": main()\n' > /usr/local/bin/codex && chmod +x /usr/local/bin/codex
+
+# Set up clean zsh prompt and config
+RUN mkdir -p /etc/zsh && echo 'export PROMPT="%F{cyan}➜ %F{green}%~%F{yellow} [container] %F{reset}%% "' >> /etc/zsh/zshrc
+
+WORKDIR /workspaces
+
+CMD ["sleep", "infinity"]

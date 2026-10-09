@@ -366,11 +366,14 @@ class LocalProcessRunner(HostBackend):
         sandbox_dir = Path.home() / ".congruence" / "sandboxes" / lane_id
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         
+        real_home = str(Path.home())
         jail_script = f"""# Congruence Worktree Sandbox Jail
 export CONGRUENCE_WORKTREE_ROOT="{cwd}"
 export WORKTREE_ROOT="{cwd}"
+export REAL_HOME="{real_home}"
 export HOME="{cwd}"
 export PWD="{cwd}"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:{real_home}/.local/bin:{real_home}/.cargo/bin:$PATH"
 
 # Guard directory changes to prevent escaping the worktree jail
 cd() {{
@@ -431,7 +434,9 @@ fi
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
+        merged_env["REAL_HOME"] = real_home
         merged_env["HOME"] = cwd
+        merged_env["PATH"] = f"/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:{real_home}/.local/bin:{real_home}/.cargo/bin:{merged_env.get('PATH', '')}"
         merged_env["CONGRUENCE_WORKTREE_ROOT"] = cwd
         merged_env["ZDOTDIR"] = str(sandbox_dir)
         merged_env["BASH_ENV"] = str(sandbox_dir / ".bashrc")

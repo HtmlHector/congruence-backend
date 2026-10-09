@@ -205,13 +205,14 @@ async def test_lane_access_denies_lane_from_foreign_project() -> None:
     host = SimpleNamespace(id="host_1", project_id="proj_1")
     project = SimpleNamespace(id="proj_1", organization_id="org_victim")
 
-    # 1) lane lookup 2) host lookup 3) project lookup 4) org membership (empty)
+    # 1) lane lookup 2) host lookup 3) project lookup 4) org membership (empty) 5) project existence (exists in victim org)
     session = SequenceSession(
         [
             MockResult([lane]),
             MockResult([host]),
             MockResult([project]),
             MockResult([]),
+            MockResult([project]),
         ]
     )
     assert await lane_access(session, user, "lane_victim") is False

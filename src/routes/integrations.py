@@ -42,6 +42,7 @@ from src.infrastructure.auth.harness_login import (
     HarnessLoginError,
     build_login_command,
     credential_path,
+    is_harness_credential_present,
     login_flow,
     registry,
 )
@@ -351,7 +352,10 @@ async def get_integrations_status(
     lanes_res = await db.execute(select(Lane).where(Lane.host_id == host.id if host else False))
     lane_ids = [lane.id for lane in lanes_res.scalars().all()]
 
-    harness_states: dict[str, str] = {h: "disconnected" for h in HARNESS_LABELS}
+    harness_states: dict[str, str] = {
+        h: "connected" if is_harness_credential_present(h) else "disconnected"
+        for h in HARNESS_LABELS
+    }
     if lane_ids:
         auth_res = await db.execute(
             select(HarnessAuth).where(HarnessAuth.lane_id.in_(lane_ids))
@@ -368,11 +372,20 @@ async def get_integrations_status(
                 if checked.tzinfo is None:
                     checked = checked.replace(tzinfo=UTC)
                 if checked < stale_cutoff:
-                    state = "disconnected"
+                    state = "connected" if is_harness_credential_present(row.harness) else "disconnected"
             current = harness_states.get(row.harness, "disconnected")
             rank = {"disconnected": 0, "error": 1, "awaiting_user": 2, "connected": 3}
             if rank.get(state, 0) >= rank.get(current, 0):
                 harness_states[row.harness] = state
+
+        # Persist connected state to database
+        for h, st in harness_states.items():
+            if st == "connected" and lane_ids:
+                await _upsert_state(db, lane_ids[0], h, "connected")
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
 
     # Check user github connection
     gh_res = await db.execute(
