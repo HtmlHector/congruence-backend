@@ -1,9 +1,10 @@
 .PHONY: setup dev dev-worker dev-socketio test lint format typecheck migrate migration docker-up docker-down clean
 
-# Setup local environment and dependencies
+# Setup local environment, dependencies, and database migrations
 setup:
 	uv sync --all-extras
 	@if [ ! -f .env ]; then cp .env.example .env && echo "Created .env from .env.example"; fi
+	uv run python scripts/setup_db.py
 
 # Start API server with hot-reload
 dev:
