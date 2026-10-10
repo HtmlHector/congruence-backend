@@ -1,0 +1,11 @@
+# Global owners
+* @parabox-team
+
+# Core infrastructure & database
+/src/infrastructure/ @parabox-team
+/alembic/ @parabox-team
+
+# CI/CD and deployment
+/.github/ @parabox-team
+/docker/ @parabox-team
+/docker-compose.yml @parabox-team

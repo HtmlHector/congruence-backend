@@ -1,0 +1,55 @@
+name: Database Migration Check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "alembic/**"
+      - "src/infrastructure/database/**"
+      - "src/contexts/**/infrastructure/models.py"
+
+jobs:
+  migration-check:
+    name: Verify Migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: parabox_test
+          POSTGRES_USER: parabox
+          POSTGRES_PASSWORD: parabox
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://parabox:parabox@localhost:5432/parabox_test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Verify Single Alembic Head
+        run: |
+          head_count=$(uv run alembic heads | wc -l)
+          if [ "$head_count" -ne 1 ]; then
+            echo "Expected exactly one Alembic head, found $head_count:"
+            uv run alembic heads
+            exit 1
+          fi
+
+      - name: Test Upgrade to Head
+        run: uv run alembic upgrade head
+
+      - name: Test Rollback to Base
+        run: uv run alembic downgrade base
+
+      - name: Test Re-apply Upgrade
+        run: uv run alembic upgrade head
