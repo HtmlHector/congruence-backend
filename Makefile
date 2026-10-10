@@ -6,6 +6,10 @@ setup:
 	@if [ ! -f .env ]; then cp .env.example .env && echo "Created .env from .env.example"; fi
 	uv run python scripts/setup_db.py
 
+# Seed sample development data into the database
+seed:
+	uv run python scripts/seed.py
+
 # Start API server with hot-reload
 dev:
 	uv run uvicorn src.bootstrap.api:app --reload --host 0.0.0.0 --port 8000
