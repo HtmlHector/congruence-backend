@@ -103,6 +103,28 @@ class EmailSettings(BaseSettings):
     from_address: str = "notifications@parabox.so"
 
 
+class IntegrationsSettings(BaseSettings):
+    """Third-party OAuth and integrations credentials."""
+
+    model_config = SettingsConfigDict(env_prefix="INTEGRATIONS_", extra="ignore")
+
+    # GitHub App / OAuth
+    github_client_id: str = "gh_client_id_placeholder"
+    github_client_secret: str = "gh_client_secret_placeholder"
+    github_webhook_secret: str = "gh_webhook_secret_placeholder"
+
+    # Slack OAuth
+    slack_client_id: str = "slack_client_id_placeholder"
+    slack_client_secret: str = "slack_client_secret_placeholder"
+
+    # Linear OAuth
+    linear_client_id: str = "linear_client_id_placeholder"
+    linear_client_secret: str = "linear_client_secret_placeholder"
+
+    # State signing secret
+    state_signing_key: str = "parabox-oauth-signing-secret-key-123"
+
+
 class Settings(BaseSettings):
     """Aggregated root settings."""
 
@@ -120,6 +142,7 @@ class Settings(BaseSettings):
     clerk: ClerkSettings = Field(default_factory=ClerkSettings)
     stripe: StripeSettings = Field(default_factory=StripeSettings)
     email: EmailSettings = Field(default_factory=EmailSettings)
+    integrations: IntegrationsSettings = Field(default_factory=IntegrationsSettings)
 
 
 @lru_cache(maxsize=1)

@@ -12,6 +12,7 @@ from src.adapters.api.routes.audit import router as audit_router
 from src.adapters.api.routes.auth import router as auth_router
 from src.adapters.api.routes.billing import router as billing_router
 from src.adapters.api.routes.health import router as health_router
+from src.adapters.api.routes.integrations import router as integrations_router
 from src.adapters.api.routes.projects import router as projects_router
 from src.adapters.api.routes.storage import router as storage_router
 from src.adapters.api.routes.webhooks.clerk import router as clerk_webhook_router
@@ -63,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(workspaces_router, prefix=api_v1)
     app.include_router(billing_router, prefix=api_v1)
     app.include_router(projects_router, prefix=api_v1)
+    app.include_router(integrations_router, prefix=api_v1)
     app.include_router(audit_router, prefix=api_v1)
     app.include_router(storage_router, prefix=api_v1)
     app.include_router(clerk_webhook_router, prefix=api_v1)

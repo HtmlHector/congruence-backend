@@ -15,6 +15,11 @@ from src.contexts.workspace.infrastructure.models import WorkspaceModel, Workspa
 from src.contexts.billing.infrastructure.models import SubscriptionModel
 from src.contexts.audit.infrastructure.models import AuditLogModel
 from src.contexts.projects.infrastructure.models import ProjectModel
+from src.contexts.integrations.infrastructure.models import (
+    IntegrationCredentialModel,
+    IntegrationConfigModel,
+    WebhookEventModel,
+)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

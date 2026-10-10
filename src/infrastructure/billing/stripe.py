@@ -76,9 +76,7 @@ class StripeService:
         )
         return {"url": str(session.url)}
 
-    def construct_webhook_event(
-        self, payload: bytes, sig_header: str
-    ) -> Any:
+    def construct_webhook_event(self, payload: bytes, sig_header: str) -> Any:
         """Validate signature and deserialize Stripe webhook payload."""
         if (
             self._webhook_secret.startswith("whsec_placeholder")

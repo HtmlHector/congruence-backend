@@ -111,6 +111,7 @@ class ClerkService:
         )
         response.raise_for_status()
         from typing import cast
+
         return cast(dict[str, Any], response.json())
 
     def verify_webhook(self, headers: dict[str, str], payload: bytes) -> dict[str, Any]:

@@ -65,6 +65,7 @@ src/
 │   ├── billing/        # Stripe customers, checkout sessions, portal & subscription tiers
 │   ├── audit/          # Immutable append-only audit trail
 │   ├── notification/   # Transactional emails (Resend) and event queues
+│   ├── integrations/   # Multi-provider integrations (OAuth, webhooks, AES-encrypted tokens)
 │   └── projects/       # Reference CRUD domain context with events and RLS
 └── adapters/
     ├── api/            # Route controllers (/api/v1/...) & FastAPI dependencies
@@ -94,6 +95,13 @@ src/
 ### Asynchronous Messaging & Background Workers (RabbitMQ)
 - Topic exchange (`parabox.events`) with persistent queues.
 - Asynchronous consumers for email notifications and domain events (`make dev-worker`).
+
+### Multi-Provider Integrations Hub
+- Native support for **GitHub**, **Slack**, **Linear**, and custom API keys/webhooks.
+- Multi-tenant OAuth handshake with cryptographically signed, expiring HMAC-SHA256 state tokens to prevent CSRF.
+- Sensitive tokens encrypted at rest via AES/Fernet encryption.
+- Inbound webhook signature verification with automatic RabbitMQ event publication (`integrations.webhook.{provider}`).
+- Row-Level Security policies on all integration credentials and workspace configuration tables.
 
 ### Realtime Synchronization (Socket.IO)
 - Mounted at `/socket.io` on the FastAPI app.

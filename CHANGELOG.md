@@ -22,5 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Message Bus:** RabbitMQ topic exchange topology via `aio-pika` with background worker consumer pool.
 - **Object Storage:** S3 / MinIO client wrapper with presigned upload/download URLs.
 - **Multi-Tenancy Security:** Defense-in-depth PostgreSQL Row-Level Security (RLS) enforcement via `app.current_workspace_id`.
+- **Integrations Context:** Multi-Provider Integration Hub supporting GitHub, Slack, Linear, and custom API keys/webhooks, complete with AES/Fernet encryption at rest, PostgreSQL RLS, signed cryptographic OAuth state validation, and RabbitMQ event streaming.
 - **Infrastructure & Tooling:** Multi-stage Dockerfiles (`api`, `worker`, `socketio`), Docker Compose for local infra, unified `Makefile`, and Alembic async migrations.
 - **Repository Governance:** GitHub Actions CI, database migration check workflow, Dependabot, CODEOWNERS, PR/Issue templates, and pre-commit hooks.
