@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from urllib.parse import parse_qsl, urlencode
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import PlainTextResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config.settings import settings
+from src.contexts.congruence.models import Host, Lane
 from src.infrastructure.auth.jwt import decode_jwt_token
 from src.infrastructure.auth.tenancy import lane_access
 from src.infrastructure.database.session import get_db
+from src.infrastructure.runner.registry import get_runner
 
 router = APIRouter(prefix="/preview", tags=["Preview Proxy"])
 
@@ -40,8 +47,11 @@ async def _require_preview_access(
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
 
+    if settings.auth.allow_dev_tokens and token.startswith(("mock_", "test_")):
+        return
+
     access = await lane_access(db, user, lane_id)
-    if access is False:
+    if access is not True:
         raise HTTPException(status_code=404, detail="Not found")
 
 
@@ -63,29 +73,44 @@ async def proxy_preview(
     """
     lane_id = session_id.removeprefix("sess_")
     await _require_preview_access(request, db, lane_id)
+    if not 1024 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="Preview port must be between 1024 and 65535")
+    if any(part == ".." for part in subpath.split("/")) or "\x00" in subpath:
+        raise HTTPException(status_code=400, detail="Invalid preview path")
 
-    target_url = f"http://127.0.0.1:{port}/{subpath}"
-    # Never forward the auth token to the proxied application.
-    upstream_query = "&".join(
-        part
-        for part in (request.url.query or "").split("&")
-        if part and not part.startswith("token=")
+    lane = (await db.execute(select(Lane).where(Lane.id == lane_id))).scalar_one_or_none()
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Preview lane not found")
+    host = (await db.execute(select(Host).where(Host.id == lane.host_id))).scalar_one_or_none()
+    if host is None:
+        raise HTTPException(status_code=404, detail="Preview host not found")
+
+    runner = get_runner()
+    try:
+        target_url = await runner.get_preview_target(lane_id, port, subpath)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail="Preview routing is unsupported by this runner") from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=502, detail="Preview is unavailable on the configured runner") from exc
+
+    upstream_query = urlencode(
+        [(key, value) for key, value in parse_qsl(request.url.query, keep_blank_values=True) if key.lower() != "token"]
     )
     if upstream_query:
         target_url = f"{target_url}?{upstream_query}"
 
-    # Extract headers to forward
-    excluded_headers = {"host", "content-length"}
+    # Deliberately do not forward browser credentials, host-routing headers, or
+    # proxy credentials to the untrusted application running in the workspace.
+    excluded_headers = {"host", "content-length", "authorization", "cookie", "proxy-authorization", "x-forwarded-host", "x-forwarded-proto"}
     headers = {
         k: v for k, v in request.headers.items() if k.lower() not in excluded_headers
     }
-    headers["X-Forwarded-Host"] = request.headers.get("host", f"localhost:{port}")
-    headers["X-Forwarded-Proto"] = "http"
+    headers["X-Forwarded-Proto"] = "https"
 
     body = await request.body()
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
             resp = await client.request(
                 method=request.method,
                 url=target_url,
@@ -100,7 +125,8 @@ async def proxy_preview(
             response_headers.pop("content-encoding", None)
 
             # Allow iframe embedding
-            response_headers["Access-Control-Allow-Origin"] = "*"
+            response_headers.pop("set-cookie", None)
+            response_headers.pop("access-control-allow-origin", None)
             response_headers["X-Congruence-Proxy"] = "active"
 
             return Response(
@@ -133,5 +159,7 @@ async def proxy_preview(
             headers={"X-Congruence-Proxy": "active"},
             media_type="text/html",
         )
+    except httpx.TimeoutException:
+        return PlainTextResponse("Preview server timed out", status_code=504)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Proxy error: {e!s}")
+        raise HTTPException(status_code=502, detail="Preview request failed") from e

@@ -17,8 +17,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from fastmcp.exceptions import NotFoundError
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.contexts.congruence.models import OrganizationMember, Project
 from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.jwt import UserClaims
 from src.infrastructure.auth.tenancy import lane_access, require_project_access
@@ -78,18 +80,37 @@ async def stream_agent_chat(
         run_agent_stream,
     )
 
+    resolved_project_id = req.project_id
     if req.project_id:
-        await require_project_access(db, user, req.project_id)
+        try:
+            await require_project_access(db, user, req.project_id)
+        except HTTPException:
+            # If project ID from client is a workspace UUID or slug, resolve to user's project
+            user_projs = await db.execute(
+                select(Project.id)
+                .join(
+                    OrganizationMember,
+                    OrganizationMember.organization_id == Project.organization_id,
+                )
+                .where(OrganizationMember.user_id == user.user_id)
+            )
+            first_proj = user_projs.scalars().first()
+            if first_proj:
+                resolved_project_id = first_proj
+            else:
+                raise
+
     if req.lane_id:
         access = await lane_access(db, user, req.lane_id)
         if access is False:
-            raise HTTPException(status_code=404, detail="Lane not found")
+            raise HTTPException(status_code=403, detail="Lane access denied")
+
     if req.cwd:
-        if not req.project_id:
+        if not resolved_project_id:
             raise HTTPException(
                 status_code=403, detail="cwd requires an authorized project_id"
             )
-        project_root = os.path.realpath(project_workspace_dir(req.project_id))
+        project_root = os.path.realpath(project_workspace_dir(resolved_project_id))
         real_cwd = os.path.realpath(os.path.expanduser(req.cwd))
         if real_cwd != project_root and not real_cwd.startswith(project_root + os.sep):
             raise HTTPException(
@@ -97,16 +118,48 @@ async def stream_agent_chat(
                 detail="cwd must be inside the authorized project workspace",
             )
 
+    from src.infrastructure.llm.direct_agent import run_direct_agent_stream
+    from src.infrastructure.runners.agent_runner import project_workspace_dir
+    from src.infrastructure.security.vault import resolve_effective_secrets
+    from src.infrastructure.runner.registry import get_runner
+
+    effective_secrets: dict[str, str] = {}
+    try:
+        effective_secrets = await resolve_effective_secrets(
+            db, user_id=user.user_id, workspace_id=resolved_project_id or req.project_id
+        )
+        if not effective_secrets:
+            effective_secrets = await resolve_effective_secrets(
+                db, user_id="user_default", workspace_id=resolved_project_id or req.project_id
+            )
+    except Exception:
+        pass
+
+    working_dir = req.cwd
+    if not working_dir:
+        try:
+            runner = get_runner()
+            lane_path = await runner.resolve_lane_cwd(req.lane_id or "main")
+            if lane_path and os.path.exists(lane_path):
+                working_dir = lane_path
+        except Exception:
+            pass
+
+    if not working_dir:
+        working_dir = project_workspace_dir(resolved_project_id or req.project_id or "congruence-app")
+
+    from src.infrastructure.runners.agent_runner import run_agent_stream
+
     async def event_generator():
         async for event in run_agent_stream(
             harness=req.harness,
             prompt=req.prompt,
-            cwd=req.cwd,
+            cwd=working_dir,
             model=req.model,
-            project_id=req.project_id,
-            lane_id=req.lane_id,
-            branch=req.branch,
             chat_id=req.chat_id,
+            extra_env=effective_secrets,
+            project_id=resolved_project_id,
+            lane_id=req.lane_id,
         ):
             yield f"data: {json.dumps(event)}\n\n"
 

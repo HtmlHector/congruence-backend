@@ -50,6 +50,7 @@ LOGIN_COMMANDS: dict[str, list[str]] = {
     # OpenCode's sign-in is an interactive provider picker inside the TUI;
     # any vendor authorize link it prints passes through the PTY unmodified.
     "opencode": ["opencode", "auth", "login"],
+    "commandcode": ["cmd", "auth", "login"],
 }
 
 SUPPORTED_HARNESSES = tuple(LOGIN_COMMANDS)
@@ -78,6 +79,7 @@ LOGIN_FLOWS: dict[str, str] = {
     "codex": "loopback_bridge",
     "antigravity": "url_paste",
     "opencode": "interactive",
+    "commandcode": "interactive",
 }
 
 
@@ -94,6 +96,7 @@ CREDENTIAL_PATHS: dict[str, str] = {
     # the presence marker the host can check instead.
     "antigravity": "~/.gemini/antigravity-cli/",
     "opencode": "~/.local/share/opencode/auth.json",
+    "commandcode": "~/.config/commandcode/auth.json",
 }
 
 # Where the CLI prints its authorize URL. Matched only so we can surface a

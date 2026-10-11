@@ -243,8 +243,9 @@ async def run_agent_stream(
     lane_id: str | None = None,
     branch: str | None = None,
     chat_id: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> AsyncGenerator[dict, None]:
-    """Execute host-native CLI agent (Antigravity, Claude Code, Codex, Shell)
+    """Execute host-native or container-native CLI agent (Antigravity, Claude Code, Codex, Shell)
     capped strictly to the project repository workspace with multi-turn session persistence.
     """
     import uuid
@@ -261,79 +262,130 @@ async def run_agent_stream(
     is_claude = "claude" in harness_normalized or "anthropic" in harness_normalized
     is_codex = "codex" in harness_normalized or "openai" in harness_normalized
 
-    if is_agy:
-        bin_path = _find_binary("agy")
-        if not bin_path:
-            yield {
-                "type": "error",
-                "message": "Antigravity CLI ('agy') not found in host PATH. Please run 'curl -fsSL https://antigravity.dev/install.sh | bash' or install agy.",
-            }
-            return
+    # Check if we should execute inside a Docker container
+    container_name = None
+    container_cwd = None
+    try:
+        from src.infrastructure.runner.docker import DockerHostRunner
+        from src.infrastructure.runner.registry import get_runner
+        runner = get_runner()
+        if isinstance(runner, DockerHostRunner):
+            host_id, host_lane_path, cont_cwd = await runner._resolve_lane_and_host(lane_id or "main")
+            c_name = await runner._ensure_container_running(host_id)
+            # Verify container is running
+            c_proc = await asyncio.create_subprocess_exec(
+                "docker", "inspect", "-f", "{{.State.Running}}", c_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            c_out, _ = await c_proc.communicate()
+            if c_out.decode().strip().lower() == "true":
+                container_name = c_name
+                container_cwd = cont_cwd
+                if host_lane_path and os.path.exists(host_lane_path):
+                    working_dir = host_lane_path
+    except Exception:
+        container_name = None
 
-        cmd = [
-            bin_path,
-            "--add-dir", working_dir,
-            "--output-format", "stream-json",
-            "--dangerously-skip-permissions",
-        ]
-        
-        # Multi-turn conversation persistence
-        conv_id_to_use = _chat_conversation_map.get(chat_id) if chat_id else None
-        if conv_id_to_use:
-            cmd.extend(["--conversation", conv_id_to_use])
+    if container_name:
+        # Container execution path
+        target_dir = container_cwd or "/workspaces/repo"
+        if is_agy:
+            cmd = ["docker", "exec", "-i"]
+            if extra_env:
+                for k, v in extra_env.items():
+                    cmd.extend(["-e", f"{k}={v}"])
+            cmd.extend([
+                "-e", "FORCE_COLOR=0",
+                "-e", "NO_COLOR=1",
+                "-w", target_dir,
+                container_name,
+                "agy",
+                "--add-dir", target_dir,
+                "--output-format", "stream-json",
+                "--dangerously-skip-permissions",
+            ])
+            conv_id_to_use = _chat_conversation_map.get(chat_id) if chat_id else None
+            if conv_id_to_use:
+                cmd.extend(["--conversation", conv_id_to_use])
 
-        if model:
-            cleaned_m = model.lower().strip()
-            mapped_model = AGY_MODEL_MAP.get(cleaned_m) or (model if "-" in model else None)
-            if mapped_model:
-                cmd.extend(["--model", mapped_model])
+            if model:
+                cleaned_m = model.lower().strip()
+                mapped_model = AGY_MODEL_MAP.get(cleaned_m) or (model if "-" in model else None)
+                if mapped_model:
+                    cmd.extend(["--model", mapped_model])
 
-        cmd.extend(["-p", prompt])
+            cmd.extend(["-p", prompt])
 
-    elif is_claude:
-        bin_path = _find_binary("claude")
-        if not bin_path:
-            yield {
-                "type": "error",
-                "message": "Claude Code CLI ('claude') not found in host PATH. Please install with 'npm install -g @anthropic-ai/claude-code'.",
-            }
-            return
+        elif is_claude:
+            cmd = ["docker", "exec", "-i"]
+            if extra_env:
+                for k, v in extra_env.items():
+                    cmd.extend(["-e", f"{k}={v}"])
+            cmd.extend([
+                "-e", "FORCE_COLOR=0",
+                "-e", "NO_COLOR=1",
+                "-w", target_dir,
+                container_name,
+                "claude",
+                "--verbose",
+                "--dangerously-skip-permissions",
+                "--output-format", "stream-json",
+            ])
+            claude_session = _chat_conversation_map.get(chat_id)
+            if not claude_session and chat_id:
+                claude_session = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claude-{chat_id}"))
+                _chat_conversation_map[chat_id] = claude_session
+            if claude_session:
+                cmd.extend(["--session-id", claude_session])
+            if model:
+                cleaned_m = model.lower().strip()
+                mapped_model = CLAUDE_MODEL_MAP.get(cleaned_m) or (model if "-" in model else None)
+                if mapped_model:
+                    cmd.extend(["--model", mapped_model])
+            cmd.extend(["-p", prompt])
 
-        cmd = [
-            bin_path,
-            "--verbose",
-            "--dangerously-skip-permissions",
-            "--output-format", "stream-json",
-        ]
+        elif is_codex:
+            cmd = ["docker", "exec", "-i"]
+            if extra_env:
+                for k, v in extra_env.items():
+                    cmd.extend(["-e", f"{k}={v}"])
+            cmd.extend([
+                "-e", "FORCE_COLOR=0",
+                "-e", "NO_COLOR=1",
+                "-w", target_dir,
+                container_name,
+                "agy",
+                "--add-dir", target_dir,
+                "--output-format", "stream-json",
+                "--dangerously-skip-permissions",
+            ])
+            conv_id_to_use = _chat_conversation_map.get(chat_id) if chat_id else None
+            if conv_id_to_use:
+                cmd.extend(["--conversation", conv_id_to_use])
+            codex_model = "gpt-oss-120b-medium"
+            if model:
+                cleaned_m = model.lower().strip()
+                codex_model = CODEX_MODEL_MAP.get(cleaned_m, codex_model)
+            cmd.extend(["--model", codex_model, "-p", prompt])
 
-        # Multi-turn session persistence for Claude
-        claude_session = _chat_conversation_map.get(chat_id)
-        if not claude_session and chat_id:
-            claude_session = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claude-{chat_id}"))
-            _chat_conversation_map[chat_id] = claude_session
-
-        if claude_session:
-            cmd.extend(["--session-id", claude_session])
-
-        if model:
-            cleaned_m = model.lower().strip()
-            mapped_model = CLAUDE_MODEL_MAP.get(cleaned_m) or (model if "-" in model else None)
-            if mapped_model:
-                cmd.extend(["--model", mapped_model])
-
-        cmd.extend(["-p", prompt])
-
-    elif is_codex:
-        bin_path = _find_binary("codex")
-        if bin_path:
-            cmd = [bin_path, "exec", prompt]
         else:
-            # Fallback to agy with Codex / OpenAI model for full multi-turn memory & tool support
+            cmd = [
+                "docker", "exec", "-i",
+                "-w", target_dir,
+                container_name,
+                "/bin/sh", "-c", prompt,
+            ]
+
+        exec_cwd = None
+    else:
+        # Local Host execution path
+        if is_agy:
             bin_path = _find_binary("agy")
             if not bin_path:
                 yield {
                     "type": "error",
-                    "message": "Neither Codex CLI nor Antigravity CLI found on host PATH.",
+                    "message": "Antigravity CLI ('agy') not found in host PATH. Please run 'curl -fsSL https://antigravity.google/cli/install.sh | bash' or install agy.",
                 }
                 return
 
@@ -343,20 +395,85 @@ async def run_agent_stream(
                 "--output-format", "stream-json",
                 "--dangerously-skip-permissions",
             ]
+            
             conv_id_to_use = _chat_conversation_map.get(chat_id) if chat_id else None
             if conv_id_to_use:
                 cmd.extend(["--conversation", conv_id_to_use])
 
-            codex_model = "gpt-oss-120b-medium"
             if model:
                 cleaned_m = model.lower().strip()
-                codex_model = CODEX_MODEL_MAP.get(cleaned_m, codex_model)
+                mapped_model = AGY_MODEL_MAP.get(cleaned_m) or (model if "-" in model else None)
+                if mapped_model:
+                    cmd.extend(["--model", mapped_model])
 
-            cmd.extend(["--model", codex_model, "-p", prompt])
+            cmd.extend(["-p", prompt])
 
-    else:
-        # Default Shell
-        cmd = ["/bin/sh", "-c", prompt]
+        elif is_claude:
+            bin_path = _find_binary("claude")
+            if not bin_path:
+                yield {
+                    "type": "error",
+                    "message": "Claude Code CLI ('claude') not found in host PATH. Please install with 'npm install -g @anthropic-ai/claude-code'.",
+                }
+                return
+
+            cmd = [
+                bin_path,
+                "--verbose",
+                "--dangerously-skip-permissions",
+                "--output-format", "stream-json",
+            ]
+
+            claude_session = _chat_conversation_map.get(chat_id)
+            if not claude_session and chat_id:
+                claude_session = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claude-{chat_id}"))
+                _chat_conversation_map[chat_id] = claude_session
+
+            if claude_session:
+                cmd.extend(["--session-id", claude_session])
+
+            if model:
+                cleaned_m = model.lower().strip()
+                mapped_model = CLAUDE_MODEL_MAP.get(cleaned_m) or (model if "-" in model else None)
+                if mapped_model:
+                    cmd.extend(["--model", mapped_model])
+
+            cmd.extend(["-p", prompt])
+
+        elif is_codex:
+            bin_path = _find_binary("codex")
+            if bin_path:
+                cmd = [bin_path, "exec", prompt]
+            else:
+                bin_path = _find_binary("agy")
+                if not bin_path:
+                    yield {
+                        "type": "error",
+                        "message": "Neither Codex CLI nor Antigravity CLI found on host PATH.",
+                    }
+                    return
+
+                cmd = [
+                    bin_path,
+                    "--add-dir", working_dir,
+                    "--output-format", "stream-json",
+                    "--dangerously-skip-permissions",
+                ]
+                conv_id_to_use = _chat_conversation_map.get(chat_id) if chat_id else None
+                if conv_id_to_use:
+                    cmd.extend(["--conversation", conv_id_to_use])
+
+                codex_model = "gpt-oss-120b-medium"
+                if model:
+                    cleaned_m = model.lower().strip()
+                    codex_model = CODEX_MODEL_MAP.get(cleaned_m, codex_model)
+
+                cmd.extend(["--model", codex_model, "-p", prompt])
+
+        else:
+            cmd = ["/bin/sh", "-c", prompt]
+
+        exec_cwd = working_dir
 
     yield {
         "type": "status",
@@ -368,11 +485,12 @@ async def run_agent_stream(
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=working_dir,
+            cwd=exec_cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={
                 **os.environ,
+                **(extra_env or {}),
                 "PYTHONUNBUFFERED": "1",
                 "NODE_NO_WARNINGS": "1",
                 "FORCE_COLOR": "0",
@@ -444,16 +562,20 @@ async def run_agent_stream(
                                 t_name = step_up.get("tool_name") or "tool"
                                 t_info = step_up.get("tool_info", {})
                                 t_params = t_info.get("parameters") or t_info.get("args") or {}
+                                t_id = step_up.get("tool_id") or t_info.get("id") or f"tc_{uuid.uuid4().hex[:8]}"
                                 t_params_str = json.dumps(t_params) if isinstance(t_params, dict) else str(t_params)
 
                                 if state == "ACTIVE":
+                                    is_approval = any(k in t_name.lower() for k in ("ask_question", "permission", "approval"))
                                     yield {
                                         "type": "tool_start",
                                         "tool": t_name,
+                                        "tool_id": t_id,
                                         "params": t_params_str,
-                                        "status": "running",
+                                        "args": t_params if isinstance(t_params, dict) else {"raw": t_params},
+                                        "status": "requires-action" if is_approval else "running",
                                     }
-                                    if "ask_question" in t_name.lower() or "permission" in t_name.lower():
+                                    if is_approval:
                                         q_text = str(t_params.get("question", t_params)) if isinstance(t_params, dict) else str(t_params)
                                         opts = t_params.get("options", []) if isinstance(t_params, dict) else []
                                         yield {
@@ -462,11 +584,14 @@ async def run_agent_stream(
                                             "options": opts,
                                         }
                                 elif state == "DONE":
+                                    t_output = str(t_info.get("output", "") or step_up.get("result", ""))
                                     yield {
                                         "type": "tool_done",
                                         "tool": t_name,
+                                        "tool_id": t_id,
                                         "params": t_params_str,
-                                        "output": str(t_info.get("output", "")),
+                                        "args": t_params if isinstance(t_params, dict) else {"raw": t_params},
+                                        "output": t_output,
                                         "duration_seconds": step_up.get("duration_seconds", 0),
                                     }
 
@@ -539,11 +664,40 @@ async def run_agent_stream(
                                 elif item.get("type") == "tool_use":
                                     t_name = item.get("name", "tool")
                                     t_input = item.get("input", {})
+                                    t_id = item.get("id") or f"tc_{uuid.uuid4().hex[:8]}"
                                     yield {
                                         "type": "tool_start",
                                         "tool": t_name,
+                                        "tool_id": t_id,
                                         "params": json.dumps(t_input) if isinstance(t_input, dict) else str(t_input),
+                                        "args": t_input if isinstance(t_input, dict) else {"raw": t_input},
                                         "status": "running",
+                                    }
+                                elif item.get("type") == "tool_result":
+                                    t_id = item.get("tool_use_id") or item.get("id") or ""
+                                    t_content = item.get("content", "")
+                                    t_output = t_content if isinstance(t_content, str) else json.dumps(t_content)
+                                    yield {
+                                        "type": "tool_done",
+                                        "tool": "tool",
+                                        "tool_id": t_id,
+                                        "output": t_output,
+                                    }
+                            continue
+
+                        elif p_type in ("user", "tool_result"):
+                            msg_obj = parsed.get("message", {}) if p_type == "user" else parsed
+                            content_list = msg_obj.get("content", []) if isinstance(msg_obj, dict) else []
+                            for item in content_list:
+                                if isinstance(item, dict) and item.get("type") == "tool_result":
+                                    t_id = item.get("tool_use_id") or item.get("id") or ""
+                                    t_content = item.get("content", "")
+                                    t_output = t_content if isinstance(t_content, str) else json.dumps(t_content)
+                                    yield {
+                                        "type": "tool_done",
+                                        "tool": "tool",
+                                        "tool_id": t_id,
+                                        "output": t_output,
                                     }
                             continue
 

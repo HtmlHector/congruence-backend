@@ -23,6 +23,15 @@ async def test_health_endpoint(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_v1_models_endpoint(client: AsyncClient):
+    response = await client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) > 0
+
+
+@pytest.mark.asyncio
 async def test_auth_me_unauthorized(client: AsyncClient):
     response = await client.get("/api/v1/auth/me")
     assert response.status_code == 401

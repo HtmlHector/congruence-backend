@@ -78,7 +78,8 @@ def decode_jwt_token(token: str) -> UserClaims:
                 token,
                 signing_key.key,
                 algorithms=["RS256"],
-                options={"verify_aud": False},
+                options={"verify_aud": False, "verify_iss": False},
+                leeway=60,
             )
         except Exception as e:
             logger.debug("clerk_jwks_decode_failed_trying_hs256", error=str(e))

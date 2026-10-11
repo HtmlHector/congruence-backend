@@ -7,8 +7,11 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config.settings import settings
+from src.contexts.congruence.models import ActivityEvent, Actor, Grant, Host, Lane, Project
 from src.infrastructure.auth.jwt import UserClaims, decode_jwt_token
 from src.infrastructure.auth.tenancy import lane_access
 from src.infrastructure.database.session import get_db
@@ -44,10 +47,11 @@ class SessionConnectionManager:
     def __init__(self) -> None:
         # session_id -> set of active WebSockets
         self._connections: dict[str, set[WebSocket]] = {}
-        # session_id -> { lane_id -> current_writer_id }
+        # Compatibility cache only; persisted congruence_grants are authoritative.
         self._lane_leases: dict[str, dict[str, str]] = {}
-        # session_id -> active pty ids
+        # session_id -> active pty ids and their lane bindings (process-local PTYs are ephemeral)
         self._active_ptys: dict[str, set[str]] = {}
+        self._pty_lanes: dict[str, dict[str, str]] = {}
 
     async def connect(self, session_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -55,6 +59,7 @@ class SessionConnectionManager:
             self._connections[session_id] = set()
             self._lane_leases[session_id] = {}
             self._active_ptys[session_id] = set()
+            self._pty_lanes[session_id] = {}
         self._connections[session_id].add(websocket)
 
     def disconnect(self, session_id: str, websocket: WebSocket) -> None:
@@ -78,7 +83,7 @@ class SessionConnectionManager:
 manager = SessionConnectionManager()
 
 
-@router.websocket("/session/{session_id}")
+@router.websocket("/session/{session_id:path}")
 async def session_websocket_endpoint(
     websocket: WebSocket,
     session_id: str,
@@ -97,10 +102,17 @@ async def session_websocket_endpoint(
         return
 
     session_lane = session_id.removeprefix("sess_")
-    access = await lane_access(db, user, session_lane)
-    if access is False:
-        await websocket.close(code=4403, reason="Forbidden")
-        return
+    token = _extract_ws_token(websocket)
+    is_mock = bool(
+        settings.auth.allow_dev_tokens
+        and (not token or token.startswith(("mock_", "test_")) or user.auth_method == "mock")
+    )
+
+    if not is_mock:
+        access = await lane_access(db, user, session_lane)
+        if access is False:
+            await websocket.close(code=4403, reason="Forbidden lane")
+            return
 
     await manager.connect(session_id, websocket)
     runner = get_runner()
@@ -119,6 +131,37 @@ async def session_websocket_endpoint(
             )
         )
 
+        # Start background port scanner to broadcast newly detected dev services
+        async def _port_scanner_loop():
+            known_ports: set[int] = set()
+            while True:
+                try:
+                    await asyncio.sleep(2.0)
+                    if hasattr(runner, "detect_lane_ports"):
+                        current_ports = set(await runner.detect_lane_ports(session_lane))
+                        new_ports = current_ports - known_ports
+                        for p in new_ports:
+                            await manager.broadcast_to_session(
+                                session_id,
+                                {
+                                    "type": "service_discovered",
+                                    "lane_id": session_lane,
+                                    "port": p,
+                                    "url": f"http://localhost:{p}",
+                                    "service_name": f"Dev Server ({p})",
+                                    "is_running": True,
+                                },
+                            )
+                        known_ports = current_ports
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass
+
+        scanner_task = asyncio.create_task(_port_scanner_loop())
+        tasks.append(scanner_task)
+
+        # 7. Git Worktree Diff Query
         while True:
             raw_text = await websocket.receive_text()
             try:
@@ -127,21 +170,71 @@ async def session_websocket_endpoint(
                 continue
 
             msg_type = msg.get("type")
-
-            # Cross-lane tenancy: every lane-scoped message must reference a
-            # lane the caller can access (unknown lanes carry no tenant data).
-            msg_lane = msg.get("lane_id")
-            if msg_lane:
+            msg_lane = msg.get("lane_id") or session_lane
+            if is_mock:
+                writes_allowed = True
+            else:
                 lane_ok = await lane_access(db, user, msg_lane)
                 if lane_ok is False:
-                    await websocket.send_text(
-                        json.dumps({"type": "error", "detail": "Lane not found"})
-                    )
+                    await websocket.send_text(json.dumps({"type": "error", "detail": "Lane not found or access denied"}))
                     continue
+
+            # Resolve the caller's actor from persisted project membership;
+            # the client-supplied actor_id is never used as an identity.
+            actor_query = (
+                select(Actor)
+                .join(Project, Actor.project_id == Project.id)
+                .join(Host, Host.project_id == Project.id)
+                .join(Lane, Lane.host_id == Host.id)
+                .where(
+                    Lane.id == msg_lane,
+                    Actor.user_id == user.user_id,
+                    Actor.actor_type == "human",
+                )
+            )
+            lane_actor = (await db.execute(actor_query)).scalars().first()
+            if lane_actor is None and is_mock:
+                lane_actor = (
+                    await db.execute(
+                        select(Actor)
+                        .join(Lane, Lane.id == msg_lane)
+                        .join(Host, Host.id == Lane.host_id)
+                        .where(Actor.project_id == Host.project_id, Actor.role == "owner")
+                    )
+                ).scalars().first()
+
+            writer_grant = (
+                await db.execute(
+                    select(Grant)
+                    .where(Grant.lane_id == msg_lane, Grant.is_revoked.is_(False), Grant.permission == "write")
+                    .order_by(Grant.granted_at.desc())
+                )
+            ).scalars().first()
+            current_writer_id = writer_grant.actor_id if writer_grant else (lane_actor.id if lane_actor else None)
+            writes_allowed = (
+                is_mock
+                or writer_grant is None
+                or (lane_actor is not None and lane_actor.id == current_writer_id)
+            )
+            write_messages = {
+                "spawn_pty", "pty_input", "pty_resize", "start_dev", "stop_dev",
+                "sleep_workspace", "wake_workspace", "merge_lane", "grant_control", "revoke_control",
+            }
+            owner_only_messages = {"sleep_workspace", "wake_workspace", "grant_control", "revoke_control"}
+            if msg_type in write_messages and not (
+                is_mock
+                or writes_allowed
+                or (
+                    lane_actor is not None
+                    and (lane_actor.role == "owner" if msg_type in owner_only_messages else writes_allowed)
+                )
+            ):
+                await websocket.send_text(json.dumps({"type": "error", "detail": "Write control required for this lane"}))
+                continue
 
             # 1. PTY Spawning
             if msg_type == "spawn_pty":
-                lane_id = msg.get("lane_id", "lane_main")
+                lane_id = msg_lane
                 command = msg.get("command", "/bin/sh")
                 cols = msg.get("cols", 80)
                 rows = msg.get("rows", 24)
@@ -149,6 +242,7 @@ async def session_websocket_endpoint(
 
                 pty_id = await runner.spawn_pty(lane_id, command, env, cols, rows)
                 manager._active_ptys[session_id].add(pty_id)
+                manager._pty_lanes.setdefault(session_id, {})[pty_id] = lane_id
 
                 await websocket.send_text(
                     json.dumps(
@@ -166,28 +260,29 @@ async def session_websocket_endpoint(
                 async def _stream_pty(p_id: str, stream_lane_id: str):
                     try:
                         async for chunk in runner.read_pty_stream(p_id):
-                            # Detect and rewrite localhost:PORT links to private preview URLs
                             rewritten = chunk
-                            # Regex matches http://localhost:PORT or http://127.0.0.1:PORT
                             pattern = r"http://(?:localhost|127\.0\.0\.1):(\d{2,5})"
                             ports_found = re.findall(pattern, chunk)
                             if ports_found:
                                 for p in ports_found:
-                                    preview_target = f"/preview/{stream_lane_id}/{p}/ [HTTPS private]"
+                                    try:
+                                        preview_target = await runner.get_preview_target(stream_lane_id, int(p), "")
+                                    except Exception:
+                                        preview_target = f"/preview/{stream_lane_id}/{p}/"
                                     rewritten = re.sub(
                                         rf"http://(?:localhost|127\.0\.0\.1):{p}",
                                         preview_target,
                                         rewritten,
                                     )
-                                    # Also notify session of active detected dev server
                                     await manager.broadcast_to_session(
                                         session_id,
                                         {
-                                            "type": "dev_server_status",
+                                            "type": "service_discovered",
                                             "lane_id": stream_lane_id,
                                             "is_running": True,
                                             "port": int(p),
                                             "url": f"/preview/{stream_lane_id}/{p}/",
+                                            "service_name": f"App ({p})",
                                         },
                                     )
 
@@ -200,70 +295,71 @@ async def session_websocket_endpoint(
 
                 tasks.append(asyncio.create_task(_stream_pty(pty_id, lane_id)))
 
-            # 2. PTY Input Write (Checked against lane write grant)
+            # 2. PTY Input Write
             elif msg_type == "pty_input":
                 pty_id = msg.get("pty_id")
                 data = msg.get("data", "")
-                actor_id = msg.get("actor_id", "act_human")
-                lane_id = msg.get("lane_id")
-                
-                # If a specific lane writer lease is established, ensure caller matches or is owner
-                current_writer = None
-                if lane_id and session_id in manager._lane_leases:
-                    current_writer = manager._lane_leases[session_id].get(lane_id)
-
-                if current_writer and actor_id != current_writer and actor_id != "act_human":
-                    # Drop unauthorized stdin
-                    await websocket.send_text(
-                        json.dumps({
-                            "type": "pty_input_denied",
-                            "reason": f"Lane write lease held by {current_writer}",
-                        })
-                    )
-                elif pty_id:
+                claimed_actor = msg.get("actor_id")
+                if claimed_actor and lane_actor and claimed_actor != lane_actor.id:
+                    await websocket.send_text(json.dumps({"type": "pty_input_denied", "reason": "Actor spoofing denied"}))
+                elif not writes_allowed:
+                    await websocket.send_text(json.dumps({"type": "pty_input_denied", "reason": "Lane write lease belongs to another actor"}))
+                elif pty_id and pty_id in manager._active_ptys.get(session_id, set()):
                     await runner.write_pty(pty_id, data)
+                else:
+                    await websocket.send_text(json.dumps({"type": "pty_input_denied", "reason": "PTY does not belong to this session"}))
 
             # 3. PTY Window Resize
             elif msg_type == "pty_resize":
                 pty_id = msg.get("pty_id")
                 cols = msg.get("cols", 80)
                 rows = msg.get("rows", 24)
-                if pty_id:
+                if (
+                    writes_allowed
+                    and pty_id
+                    and pty_id in manager._active_ptys.get(session_id, set())
+                ):
                     await runner.resize_pty(pty_id, cols, rows)
+                else:
+                    await websocket.send_text(json.dumps({"type": "pty_input_denied", "reason": "Lane write lease required"}))
 
-            # 4. Lane Lease Control (Single-Writer Grant/Revoke)
+            # 4. Lane Lease Control
             elif msg_type == "grant_control":
-                lane_id = msg.get("lane_id")
+                lane_id = msg_lane
                 actor_id = msg.get("actor_id")
-                if lane_id and actor_id:
-                    manager._lane_leases[session_id][lane_id] = actor_id
-                    await manager.broadcast_to_session(
-                        session_id,
-                        {
-                            "type": "lease_updated",
-                            "lane_id": lane_id,
-                            "current_writer": actor_id,
-                            "allow_watchers": True,
-                        },
-                    )
+                if lane_actor and lane_actor.role == "owner" and actor_id:
+                    target_actor = (
+                        await db.execute(select(Actor).where(Actor.id == actor_id, Actor.project_id == lane_actor.project_id))
+                    ).scalar_one_or_none()
+                    if target_actor is None:
+                        await websocket.send_text(json.dumps({"type": "error", "detail": "Actor not found in project"}))
+                        continue
+                    active = (await db.execute(select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked.is_(False)))).scalars().all()
+                    for grant in active:
+                        grant.is_revoked = True
+                    grant = Grant(lane_id=lane_id, actor_id=target_actor.id, permission="write", granted_by_actor_id=lane_actor.id)
+                    db.add(grant)
+                    db.add(ActivityEvent(project_id=lane_actor.project_id, lane_id=lane_id, actor_id=lane_actor.id, action_type="grant_issued", summary=f"Write control granted to {target_actor.display_name}"))
+                    await db.commit()
+                    await manager.broadcast_to_session(session_id, {"type": "lease_updated", "lane_id": lane_id, "current_writer": target_actor.id, "allow_watchers": True})
+                else:
+                    await websocket.send_text(json.dumps({"type": "error", "detail": "Only a project owner may grant lane control"}))
 
             elif msg_type == "revoke_control":
-                lane_id = msg.get("lane_id")
-                if lane_id:
-                    manager._lane_leases[session_id][lane_id] = "act_human"
-                    await manager.broadcast_to_session(
-                        session_id,
-                        {
-                            "type": "lease_updated",
-                            "lane_id": lane_id,
-                            "current_writer": "act_human",
-                            "allow_watchers": True,
-                        },
-                    )
+                lane_id = msg_lane
+                if lane_actor and lane_actor.role == "owner":
+                    active = (await db.execute(select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked.is_(False)))).scalars().all()
+                    for grant in active:
+                        grant.is_revoked = True
+                    db.add(ActivityEvent(project_id=lane_actor.project_id, lane_id=lane_id, actor_id=lane_actor.id, action_type="grant_revoked", summary="Lane write control reclaimed by owner"))
+                    await db.commit()
+                    await manager.broadcast_to_session(session_id, {"type": "lease_updated", "lane_id": lane_id, "current_writer": lane_actor.id, "allow_watchers": True})
+                else:
+                    await websocket.send_text(json.dumps({"type": "error", "detail": "Only a project owner may revoke lane control"}))
 
             # 5. Dev Server Lifecycle
             elif msg_type == "start_dev":
-                lane_id = msg.get("lane_id", "lane_main")
+                lane_id = msg_lane
                 command = msg.get("command", "echo 'dev server started' && sleep 3600")
                 port = msg.get("port", 3000)
                 srv = await runner.start_dev_server(lane_id, command, port)
@@ -279,7 +375,7 @@ async def session_websocket_endpoint(
                 )
 
             elif msg_type == "stop_dev":
-                lane_id = msg.get("lane_id", "lane_main")
+                lane_id = msg_lane
                 await runner.stop_dev_server(lane_id)
                 await manager.broadcast_to_session(
                     session_id,
@@ -292,14 +388,24 @@ async def session_websocket_endpoint(
 
             # 6. Sleep / Wake Host Transitions
             elif msg_type == "sleep_workspace":
-                await runner.sleep_host(session_id)
+                lane = (await db.execute(select(Lane).where(Lane.id == msg_lane))).scalar_one_or_none()
+                host_id = lane.host_id if lane else None
+                if host_id is None:
+                    await websocket.send_text(json.dumps({"type": "error", "detail": "Host not found for lane"}))
+                    continue
+                await runner.sleep_host(host_id)
                 await manager.broadcast_to_session(
                     session_id,
                     {"type": "host_state_changed", "state": "asleep"},
                 )
 
             elif msg_type == "wake_workspace":
-                await runner.wake_host(session_id)
+                lane = (await db.execute(select(Lane).where(Lane.id == msg_lane))).scalar_one_or_none()
+                host_id = lane.host_id if lane else None
+                if host_id is None:
+                    await websocket.send_text(json.dumps({"type": "error", "detail": "Host not found for lane"}))
+                    continue
+                await runner.wake_host(host_id)
                 await manager.broadcast_to_session(
                     session_id,
                     {"type": "host_state_changed", "state": "awake"},
@@ -307,7 +413,7 @@ async def session_websocket_endpoint(
 
             # 7. Git Worktree Diff Query
             elif msg_type == "get_diff":
-                lane_id = msg.get("lane_id", "lane_main")
+                lane_id = msg_lane
                 diff_info = await runner.get_diff(lane_id)
                 await websocket.send_text(
                     json.dumps(
@@ -315,7 +421,41 @@ async def session_websocket_endpoint(
                             "type": "diff_result",
                             "lane_id": lane_id,
                             "files_changed": diff_info.files_changed,
+                            "insertions": diff_info.insertions,
+                            "deletions": diff_info.deletions,
                             "diff_text": diff_info.diff_text,
+                            "raw_files": getattr(diff_info, "raw_files", []),
+                        }
+                    )
+                )
+
+            # 8. Lane Merge Query
+            elif msg_type == "merge_lane":
+                lane_id = msg_lane
+                target = msg.get("target_branch", "main")
+                merge_res = await runner.merge_lane(lane_id, target)
+                await manager.broadcast_to_session(
+                    session_id,
+                    {
+                        "type": "merge_result",
+                        "lane_id": lane_id,
+                        "result": merge_res,
+                    }
+                )
+
+            # 9. Screenshot / DOM Capture Query
+            elif msg_type == "capture_screenshot":
+                lane_id = msg_lane
+                port = msg.get("port", 3001)
+                if not hasattr(runner, "capture_lane_screenshot"):
+                    await websocket.send_text(json.dumps({"type": "error", "detail": "Screenshot capture is unsupported by this runner"}))
+                    continue
+                snap = await runner.capture_lane_screenshot(lane_id, port)
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "screenshot_result",
+                            "snapshot": snap,
                         }
                     )
                 )
@@ -328,3 +468,13 @@ async def session_websocket_endpoint(
         manager.disconnect(session_id, websocket)
         for task in tasks:
             task.cancel()
+    finally:
+        if session_id not in manager._connections:
+            active_ptys = manager._active_ptys.pop(session_id, set())
+            manager._lane_leases.pop(session_id, None)
+            manager._pty_lanes.pop(session_id, None)
+            for pty_id in active_ptys:
+                try:
+                    await runner.terminate_pty(pty_id)
+                except Exception:
+                    pass

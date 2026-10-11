@@ -20,6 +20,9 @@ from src.infrastructure.database.session import get_db
 from src.main import app
 
 
+_MOCK_VAULT: dict[str, Any] = {}
+
+
 class MockScalars:
     def __init__(self, rows=None):
         self._rows = rows or []
@@ -32,8 +35,9 @@ class MockScalars:
 
 
 class MockResult:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, rowcount=1):
         self._rows = rows or []
+        self.rowcount = rowcount
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -65,7 +69,6 @@ class MockResult:
         return MockScalars(items)
 
 
-
 class MockAsyncSession:
     def __init__(self):
         self.commit = AsyncMock()
@@ -74,10 +77,25 @@ class MockAsyncSession:
         self.refresh = AsyncMock()
 
     def add(self, instance):
-        pass
+        if hasattr(instance, "__tablename__") and instance.__tablename__ == "congruence_vault_secrets":
+            _MOCK_VAULT[instance.id] = instance
 
     async def execute(self, statement, params=None):
         stmt_str = str(statement)
+        if "congruence_vault_secrets" in stmt_str:
+            if "DELETE" in stmt_str:
+                count = len(_MOCK_VAULT)
+                _MOCK_VAULT.clear()
+                return MockResult([], rowcount=max(count, 1))
+            return MockResult(list(_MOCK_VAULT.values()))
+        if "congruence_lanes" in stmt_str:
+            if "lane_unknown" in stmt_str:
+                return MockResult([])
+            from src.contexts.congruence.models import Lane
+            return MockResult([Lane(id="lane_x", host_id="host_x", name="lane_x", slug="lane-x", worktree_path="/tmp", branch_name="main")])
+        if "congruence_hosts" in stmt_str:
+            from src.contexts.congruence.models import Host
+            return MockResult([Host(id="host_x", project_id="proj_x", state="awake")])
         if "congruence_github_accounts" in stmt_str:
             return MockResult([])
         if "subscription.subscriptions" in stmt_str:

@@ -35,3 +35,18 @@ async def health_check(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
         "database": db_status,
         "version": "0.1.0",
     }
+
+
+@router.get("/v1/models")
+@router.get("/api/v1/models")
+async def list_models() -> dict[str, Any]:
+    """OpenAI-compatible models list endpoint for local AI tools and extensions."""
+    models = [
+        {"id": "claude-3-7-sonnet", "object": "model", "created": 1740000000, "owned_by": "anthropic"},
+        {"id": "claude-3-5-sonnet", "object": "model", "created": 1729641600, "owned_by": "anthropic"},
+        {"id": "gpt-4o", "object": "model", "created": 1715558400, "owned_by": "openai"},
+        {"id": "o3-mini", "object": "model", "created": 1738000000, "owned_by": "openai"},
+        {"id": "gemini-2.5-pro", "object": "model", "created": 1740000000, "owned_by": "google"},
+        {"id": "gemini-2.5-flash", "object": "model", "created": 1740000000, "owned_by": "google"},
+    ]
+    return {"object": "list", "data": models}

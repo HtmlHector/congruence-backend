@@ -9,8 +9,9 @@ import pty
 import struct
 import tempfile
 import termios
-from pathlib import Path
 from collections.abc import AsyncGenerator
+from pathlib import Path
+from typing import Any
 
 from src.infrastructure.runner.base import (
     DevServerInfo,
@@ -548,6 +549,24 @@ fi
             except OSError:
                 pass
 
+    async def get_preview_target(self, lane_id: str, port: int, subpath: str) -> str:
+        """Build a fixed loopback URL only for a server started by this runner."""
+        from urllib.parse import quote
+
+        server = self._dev_server_info.get(lane_id)
+        proc = self._dev_servers.get(lane_id)
+        if (
+            server is None
+            or server.port != port
+            or proc is None
+            or proc.returncode is not None
+            or not 1024 <= port <= 65535
+            or any(part == ".." for part in subpath.split("/"))
+            or "\x00" in subpath
+        ):
+            raise RuntimeError("Preview port is not an active dev server for this lane")
+        return f"http://127.0.0.1:{port}/{quote(subpath.lstrip('/'), safe='/')}"
+
     async def start_dev_server(
         self, lane_id: str, command: str, port: int = 3000
     ) -> DevServerInfo:
@@ -720,6 +739,7 @@ fi
         else:
             try:
                 from sqlalchemy import select
+
                 from src.contexts.congruence.models import Lane
                 from src.infrastructure.database.session import AsyncSessionFactory
                 async with AsyncSessionFactory() as session:

@@ -376,3 +376,26 @@ class ChatSession(Base, TimestampMixin):
     messages_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
 
 
+class VaultSecret(Base, TimestampMixin):
+    """Encrypted API keys and environment variables scoped to user or workspace."""
+
+    __tablename__ = "congruence_vault_secrets"
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=lambda: generate_id("sec")
+    )
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    workspace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(32), default="custom", nullable=False)  # openai, anthropic, google, openrouter, custom
+    key_name: Mapped[str] = mapped_column(String(128), nullable=False)  # OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, etc.
+    encrypted_value: Mapped[str] = mapped_column(Text, nullable=False)
+    masked_value: Mapped[str] = mapped_column(String(64), nullable=False)  # sk-ant-••••••••1234
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "workspace_id", "key_name", name="uq_vault_secret_key"),
+    )
+
+
+

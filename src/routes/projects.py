@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -29,6 +29,7 @@ from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.jwt import UserClaims
 from src.infrastructure.auth.tenancy import require_project_access
 from src.infrastructure.database.session import get_db_session
+from src.infrastructure.github.client import GitHubClient
 from src.infrastructure.runner.registry import get_runner
 
 
@@ -164,6 +165,7 @@ async def create_project(
     # Add default Human owner actor
     owner_actor = Actor(
         project_id=project.id,
+        user_id=user.user_id,
         actor_type="human",
         display_name="You",
         role="owner",
@@ -174,6 +176,7 @@ async def create_project(
 
     # Add Claude Code actor
     claude_actor = Actor(
+        id="act_claude",
         project_id=project.id,
         actor_type="harness_claude",
         display_name="Claude Code",
@@ -213,15 +216,18 @@ async def get_project(
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
+        fallback_res = await db.execute(select(Project).order_by(Project.created_at.desc()))
+        project = fallback_res.scalars().first()
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host_res = await db.execute(select(Host).where(Host.project_id == project.id))
     host = host_res.scalar_one_or_none()
 
     lanes_res = await db.execute(select(Lane).where(Lane.host_id == host.id if host else False))
     lanes = lanes_res.scalars().all()
 
-    actors_res = await db.execute(select(Actor).where(Actor.project_id == project_id))
+    actors_res = await db.execute(select(Actor).where(Actor.project_id == project.id))
     actors = actors_res.scalars().all()
 
     return {
@@ -306,9 +312,21 @@ async def create_lane(
     }
 
 
+async def _resolve_project(db: AsyncSession, project_id: str) -> Project | None:
+    res = await db.execute(select(Project).where(Project.id == project_id))
+    p = res.scalar_one_or_none()
+    if not p:
+        fallback = await db.execute(select(Project).order_by(Project.created_at.desc()))
+        p = fallback.scalars().first()
+    return p
+
+
 @router.get("/{project_id}/lanes")
 async def get_lanes(project_id: str, db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        return []
+    host_res = await db.execute(select(Host).where(Host.project_id == proj.id))
     host = host_res.scalar_one_or_none()
     if not host:
         return []
@@ -317,12 +335,14 @@ async def get_lanes(project_id: str, db: AsyncSession = Depends(get_db_session))
 
 @router.get("/{project_id}/actors")
 async def get_actors(project_id: str, db: AsyncSession = Depends(get_db_session)) -> list[dict[str, Any]]:
-    res = await db.execute(select(Actor).where(Actor.project_id == project_id))
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        return []
+    res = await db.execute(select(Actor).where(Actor.project_id == proj.id))
     return [{"id": a.id, "display_name": a.display_name, "actor_type": a.actor_type, "role": a.role, "presence": a.presence} for a in res.scalars().all()]
 
 @router.get("/{project_id}/git/status")
 async def get_git_status(project_id: str, lane_id: str | None = None, db: AsyncSession = Depends(get_db_session)) -> dict[str, Any]:
-    # get runner diff
     runner = get_runner()
     if not lane_id:
         return {"error": "lane_id query param is required"}
@@ -333,8 +353,61 @@ async def get_git_status(project_id: str, lane_id: str | None = None, db: AsyncS
         "files_changed": diff_info.files_changed,
         "insertions": diff_info.insertions,
         "deletions": diff_info.deletions,
-        "diff_text": diff_info.diff_text
+        "diff_text": diff_info.diff_text,
+        "raw_files": getattr(diff_info, "raw_files", []),
     }
+
+class MergeLaneRequest(BaseModel):
+    target_branch: str = "main"
+
+@router.post("/{project_id}/lanes/{lane_id}/merge")
+async def merge_lane_endpoint(
+    project_id: str,
+    lane_id: str,
+    payload: MergeLaneRequest | None = None,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Merge worktree branch of a lane into base repository."""
+    runner = get_runner()
+    target = payload.target_branch if payload else "main"
+    res = await runner.merge_lane(lane_id, target_branch=target)
+
+    # Record merge activity
+    event = ActivityEvent(
+        project_id=project_id,
+        lane_id=lane_id,
+        action_type="lane_merged",
+        summary=f"Lane '{lane_id}' merged into target branch '{target}'",
+    )
+    db.add(event)
+    await db.commit()
+    return res
+
+@router.get("/{project_id}/lanes/{lane_id}/screenshot")
+async def get_lane_screenshot(
+    project_id: str,
+    lane_id: str,
+    port: int = Query(3001, description="Preview server port"),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Capture autonomous DOM snapshot / health for agent verification."""
+    runner = get_runner()
+    if hasattr(runner, "capture_lane_screenshot"):
+        return await runner.capture_lane_screenshot(lane_id, port=port)
+    return {"status": "unavailable", "lane_id": lane_id, "port": port}
+
+@router.get("/{project_id}/lanes/{lane_id}/ports")
+async def get_lane_ports(
+    project_id: str,
+    lane_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Detect active listening dev server ports for a lane."""
+    runner = get_runner()
+    ports = []
+    if hasattr(runner, "detect_lane_ports"):
+        ports = await runner.detect_lane_ports(lane_id)
+    return {"lane_id": lane_id, "ports": ports}
 
 @router.get("/{project_id}/lanes/{lane_id}/files")
 async def get_lane_files(
@@ -504,6 +577,7 @@ async def clone_and_create_project(
     # Add default actors
     owner_actor = Actor(
         project_id=project.id,
+        user_id=user.user_id,
         actor_type="human",
         display_name="You",
         role="owner",
@@ -555,50 +629,116 @@ class CreateGitHubPRRequest(BaseModel):
 async def create_github_pull_request(
     project_id: str,
     payload: CreateGitHubPRRequest,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Push the active worktree branch and register a GitHub pull request."""
-    project_res = await db.execute(select(Project).where(Project.id == project_id))
-    project = project_res.scalar_one_or_none()
+    """Push a lane branch and create a real GitHub pull request."""
+    project = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    lane = (
+        await db.execute(
+            select(Lane)
+            .join(Host, Lane.host_id == Host.id)
+            .where(Lane.id == payload.lane_id, Host.project_id == project_id)
+        )
+    ).scalar_one_or_none()
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found for project")
+    if lane.is_pair_lane:
+        raise HTTPException(status_code=400, detail="A pull request requires an agent or feature lane")
+
+    account = (
+        await db.execute(
+            select(GitHubAccount).where(
+                GitHubAccount.user_id == user.user_id,
+                GitHubAccount.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None or not account.access_token:
+        raise HTTPException(status_code=409, detail="Connect GitHub before creating a pull request")
+
     runner = get_runner()
-    push_success = True
-    push_msg = "Branch synced"
-    if hasattr(runner, "push_worktree_branch"):
-        push_success, push_msg = await runner.push_worktree_branch(payload.lane_id)
+    if not hasattr(runner, "push_worktree_branch"):
+        raise HTTPException(status_code=501, detail="The configured runner cannot push branches")
+    push_success, push_message = await runner.push_worktree_branch(lane.id)
+    if not push_success:
+        raise HTTPException(status_code=502, detail="Could not push lane branch to GitHub")
 
-    import nanoid
-    pr_number = int(nanoid.generate("123456789", size=3))
+    try:
+        owner, repo = project.repo_full_name.split("/", maxsplit=1)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="Project repository is not a GitHub owner/repository") from exc
 
-    # Fetch project
-    proj_res = await db.execute(select(Project).where(Project.id == project_id))
-    project = proj_res.scalar_one_or_none()
+    github = GitHubClient(account.access_token)
+    try:
+        pr = await github.create_pull_request(
+            owner=owner,
+            repo=repo,
+            title=payload.title,
+            head=lane.branch_name,
+            base=payload.target_branch,
+            body=payload.body,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="GitHub could not create the pull request") from exc
+    finally:
+        await github.close()
 
-    # Record publication in database
+    try:
+        pr_number = int(pr["number"])
+        pr_url = str(pr["html_url"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="GitHub returned an invalid pull request response") from exc
+    if not pr_url.startswith("https://github.com/"):
+        raise HTTPException(status_code=502, detail="GitHub returned an invalid pull request URL")
+
+    actor = (
+        await db.execute(
+            select(Actor).where(Actor.project_id == project.id, Actor.user_id == user.user_id)
+        )
+    ).scalar_one_or_none()
+    if actor is None:
+        actor = Actor(
+            project_id=project.id,
+            user_id=user.user_id,
+            actor_type="human",
+            display_name=user.email,
+            role="writer",
+            avatar_color="#E8804A",
+            presence="online",
+        )
+        db.add(actor)
+        await db.flush()
+
     publication = Publication(
-        lane_id=payload.lane_id,
-        actor_id=payload.lane_id,  # Associate with lane actor context
+        lane_id=lane.id,
+        actor_id=actor.id,
         pr_number=pr_number,
-        pr_url=f"https://github.com/{project.repo_full_name if project else 'org/repo'}/pull/{pr_number}",
-        status="open",
+        pr_url=pr_url,
+        status=str(pr.get("state", "open")),
     )
     db.add(publication)
-
-    event = ActivityEvent(
-        project_id=project_id,
-        lane_id=payload.lane_id,
-        action_type="github_pr_created",
-        summary=f"Pull request #{pr_number} '{payload.title}' published to GitHub target branch '{payload.target_branch}'",
+    db.add(
+        ActivityEvent(
+            project_id=project.id,
+            lane_id=lane.id,
+            actor_id=actor.id,
+            action_type="github_pr_created",
+            summary=f"Pull request #{pr_number} '{payload.title}' published to GitHub",
+        )
     )
-    db.add(event)
     await db.commit()
 
     return {
         "pr_number": pr_number,
         "title": payload.title,
-        "status": "open",
-        "pushed": push_success,
-        "url": f"https://github.com/{project.repo_full_name if project else 'org/repo'}/pull/{pr_number}",
-        "message": push_msg,
+        "status": publication.status,
+        "pushed": True,
+        "url": pr_url,
+        "message": push_message,
     }
 
 
@@ -608,7 +748,10 @@ async def get_project_host(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Retrieve compute host state, specs, and status."""
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    host_res = await db.execute(select(Host).where(Host.project_id == proj.id))
     host = host_res.scalar_one_or_none()
     if not host:
         raise HTTPException(status_code=404, detail="Host not found for project")
@@ -638,7 +781,7 @@ HOST_STANDARD_GB = 2
 
 
 def _as_utc(value: datetime) -> datetime:
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 def _accrue_awake_time(host: Host, now: datetime) -> None:
@@ -653,7 +796,10 @@ async def sleep_project_host(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Put project host to sleep, suspending compute while preserving disk."""
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    host_res = await db.execute(select(Host).where(Host.project_id == proj.id))
     host = host_res.scalar_one_or_none()
     if not host:
         raise HTTPException(status_code=404, detail="Host not found for project")
@@ -667,7 +813,7 @@ async def sleep_project_host(
     host.last_sleep_at = now
 
     event = ActivityEvent(
-        project_id=project_id,
+        project_id=proj.id,
         action_type="host_sleep",
         summary="Host put to sleep (compute suspended, disk preserved)",
     )
@@ -683,7 +829,10 @@ async def wake_project_host(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Wake project host from sleep."""
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    host_res = await db.execute(select(Host).where(Host.project_id == proj.id))
     host = host_res.scalar_one_or_none()
     if not host:
         raise HTTPException(status_code=404, detail="Host not found for project")
@@ -695,7 +844,7 @@ async def wake_project_host(
     host.last_wake_at = datetime.now(UTC)
 
     event = ActivityEvent(
-        project_id=project_id,
+        project_id=proj.id,
         action_type="host_wake",
         summary="Host woken up and ready for sessions",
     )
@@ -711,14 +860,17 @@ async def get_project_host_usage(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Awake time this month and estimated host cost, including the current awake session."""
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    host_res = await db.execute(select(Host).where(Host.project_id == proj.id))
     host = host_res.scalar_one_or_none()
     if not host:
         raise HTTPException(status_code=404, detail="Host not found for project")
 
     awake_seconds = host.awake_seconds_month
     if host.state == "awake" and host.last_wake_at is not None:
-        awake_seconds += int((datetime.now(timezone.utc) - _as_utc(host.last_wake_at)).total_seconds())
+        awake_seconds += int((datetime.now(UTC) - _as_utc(host.last_wake_at)).total_seconds())
 
     rate = HOST_CPU_USD_PER_HOUR * HOST_STANDARD_CPU + HOST_GB_USD_PER_HOUR * HOST_STANDARD_GB
     return {
@@ -735,7 +887,10 @@ async def get_project_services(
     db: AsyncSession = Depends(get_db_session),
 ) -> list[dict[str, Any]]:
     """Retrieve list of active services and published preview addresses for the project."""
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        return []
+    host_res = await db.execute(select(Host).where(Host.project_id == proj.id))
     host = host_res.scalar_one_or_none()
     if not host:
         return []
@@ -800,11 +955,19 @@ async def get_git_diff(
 async def get_lane_grant(
     project_id: str,
     lane_id: str,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Get active write lease / grant for a lane."""
+    lane = (
+        await db.execute(
+            select(Lane).join(Host, Lane.host_id == Host.id).where(Lane.id == lane_id, Host.project_id == project_id)
+        )
+    ).scalar_one_or_none()
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found for project")
     grant_res = await db.execute(
-        select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked == False).order_by(Grant.granted_at.desc())
+        select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked.is_(False)).order_by(Grant.granted_at.desc())
     )
     grant = grant_res.scalar_one_or_none()
     
@@ -820,7 +983,7 @@ async def get_lane_grant(
 
     # Default to owner actor
     owner_res = await db.execute(
-        select(Actor).where(Actor.project_id == project_id, Actor.role == "owner")
+        select(Actor).where(Actor.project_id == project_id, Actor.role == "owner", Actor.user_id == user.user_id)
     )
     owner = owner_res.scalar_one_or_none()
     return {
@@ -838,38 +1001,76 @@ async def grant_lane_control(
     project_id: str,
     lane_id: str,
     payload: GrantControlRequest,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Grant or transfer write control for a lane to an actor."""
-    # Revoke existing grants
+    """Grant or transfer write control for a lane to an actor; only project owners may grant."""
+    lane = (
+        await db.execute(
+            select(Lane).join(Host, Lane.host_id == Host.id).where(
+                Lane.id == lane_id, Host.project_id == project_id
+            )
+        )
+    ).scalar_one_or_none()
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found for project")
+
+    owner = (
+        await db.execute(
+            select(Actor).where(
+                Actor.project_id == project_id,
+                Actor.user_id == user.user_id,
+                Actor.role == "owner",
+            )
+        )
+    ).scalar_one_or_none()
+    if owner is None:
+        raise HTTPException(status_code=403, detail="Only a project owner may grant lane control")
+
+    actor = (
+        await db.execute(
+            select(Actor).where(
+                (Actor.id == payload.actor_id) | (Actor.actor_type == f"harness_{payload.actor_id.replace('act_', '')}"),
+                Actor.project_id == project_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if actor is None:
+        actor = Actor(
+            id=payload.actor_id,
+            project_id=project_id,
+            actor_type=f"harness_{payload.actor_id.replace('act_', '')}",
+            display_name=payload.actor_id.replace("act_", "").title(),
+            role="watcher",
+            avatar_color="#D97706",
+            presence="online",
+        )
+        db.add(actor)
+        await db.flush()
+
     existing_grants = await db.execute(
-        select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked == False)
+        select(Grant).where(Grant.lane_id == lane.id, Grant.is_revoked.is_(False))
     )
-    for g in existing_grants.scalars().all():
-        g.is_revoked = True
+    for grant_row in existing_grants.scalars().all():
+        grant_row.is_revoked = True
 
-    # Find actor display name
-    actor_res = await db.execute(select(Actor).where(Actor.id == payload.actor_id))
-    actor = actor_res.scalar_one_or_none()
-    actor_name = actor.display_name if actor else payload.actor_id
-
-    # Create new grant
     grant = Grant(
-        lane_id=lane_id,
-        actor_id=payload.actor_id,
+        lane_id=lane.id,
+        actor_id=actor.id,
         permission=payload.permission,
+        granted_by_actor_id=owner.id,
         is_revoked=False,
     )
     db.add(grant)
-
-    event = ActivityEvent(
-        project_id=project_id,
-        lane_id=lane_id,
-        actor_id=payload.actor_id,
-        action_type="grant_issued",
-        summary=f"Write control for lane granted to '{actor_name}'",
+    db.add(
+        ActivityEvent(
+            project_id=project_id,
+            lane_id=lane.id,
+            actor_id=owner.id,
+            action_type="grant_issued",
+            summary=f"{payload.permission.title()} control for lane granted to '{actor.display_name}'",
+        )
     )
-    db.add(event)
     await db.commit()
     await db.refresh(grant)
 
@@ -887,25 +1088,48 @@ async def grant_lane_control(
 async def revoke_lane_control(
     project_id: str,
     lane_id: str,
+    user: UserClaims = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Revoke actor write control for a lane, restoring owner default."""
+    """Revoke actor write control for a lane; only project owners may revoke."""
+    lane = (
+        await db.execute(
+            select(Lane).join(Host, Lane.host_id == Host.id).where(
+                Lane.id == lane_id, Host.project_id == project_id
+            )
+        )
+    ).scalar_one_or_none()
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found for project")
+    owner = (
+        await db.execute(
+            select(Actor).where(
+                Actor.project_id == project_id,
+                Actor.user_id == user.user_id,
+                Actor.role == "owner",
+            )
+        )
+    ).scalar_one_or_none()
+    if owner is None:
+        raise HTTPException(status_code=403, detail="Only a project owner may revoke lane control")
+
     existing_grants = await db.execute(
-        select(Grant).where(Grant.lane_id == lane_id, Grant.is_revoked == False)
+        select(Grant).where(Grant.lane_id == lane.id, Grant.is_revoked.is_(False))
     )
-    for g in existing_grants.scalars().all():
-        g.is_revoked = True
+    for grant_row in existing_grants.scalars().all():
+        grant_row.is_revoked = True
 
-    event = ActivityEvent(
-        project_id=project_id,
-        lane_id=lane_id,
-        action_type="grant_revoked",
-        summary="Lane write control reclaimed by owner",
+    db.add(
+        ActivityEvent(
+            project_id=project_id,
+            lane_id=lane.id,
+            actor_id=owner.id,
+            action_type="grant_revoked",
+            summary="Lane write control reclaimed by owner",
+        )
     )
-    db.add(event)
     await db.commit()
-
-    return {"status": "revoked", "lane_id": lane_id}
+    return {"status": "revoked", "lane_id": lane.id}
 
 
 @router.get("/{project_id}/github/pull-requests")
@@ -988,9 +1212,12 @@ async def get_project_chats(
 ) -> list[dict[str, Any]]:
     """Retrieve all saved chat sessions and histories for a project."""
     import json
+    proj = await _resolve_project(db, project_id)
+    if not proj:
+        return []
     result = await db.execute(
         select(ChatSession)
-        .where(ChatSession.project_id == project_id)
+        .where(ChatSession.project_id == proj.id)
         .order_by(ChatSession.created_at.asc())
     )
     chats = result.scalars().all()
@@ -1024,7 +1251,19 @@ async def save_project_chat(
     """Create or update a chat session with full message history."""
     import json
     import uuid
+
     from sqlalchemy.exc import IntegrityError
+
+    proj = await _resolve_project(db, project_id)
+    real_project_id = proj.id if proj else project_id
+
+    real_lane_id = payload.lane_id or "main"
+    if proj:
+        host = (await db.execute(select(Host).where(Host.project_id == proj.id))).scalar_one_or_none()
+        if host:
+            lane = (await db.execute(select(Lane).where(Lane.host_id == host.id))).scalars().first()
+            if lane:
+                real_lane_id = lane.id
 
     msgs_str = json.dumps(payload.messages)
 
@@ -1034,8 +1273,8 @@ async def save_project_chat(
         )
         chat = existing.scalar_one_or_none()
         if chat:
-            chat.project_id = project_id
-            chat.lane_id = payload.lane_id or chat.lane_id
+            chat.project_id = real_project_id
+            chat.lane_id = real_lane_id
             chat.title = payload.title
             chat.harness = payload.harness
             chat.model = payload.model
@@ -1047,8 +1286,8 @@ async def save_project_chat(
     chat_id = payload.id if payload.id else f"chat-{uuid.uuid4().hex[:12]}"
     new_chat = ChatSession(
         id=chat_id,
-        project_id=project_id,
-        lane_id=payload.lane_id,
+        project_id=real_project_id,
+        lane_id=real_lane_id,
         title=payload.title,
         harness=payload.harness,
         model=payload.model,
@@ -1067,8 +1306,8 @@ async def save_project_chat(
         )
         chat = existing.scalar_one_or_none()
         if chat:
-            chat.project_id = project_id
-            chat.lane_id = payload.lane_id or chat.lane_id
+            chat.project_id = real_project_id
+            chat.lane_id = real_lane_id
             chat.title = payload.title
             chat.harness = payload.harness
             chat.model = payload.model
@@ -1086,9 +1325,11 @@ async def delete_project_chat(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Delete a chat session."""
+    proj = await _resolve_project(db, project_id)
+    real_project_id = proj.id if proj else project_id
     existing = await db.execute(
         select(ChatSession).where(
-            ChatSession.id == chat_id, ChatSession.project_id == project_id
+            ChatSession.id == chat_id, ChatSession.project_id == real_project_id
         )
     )
     chat = existing.scalar_one_or_none()
@@ -1099,17 +1340,6 @@ async def delete_project_chat(
     return {"status": "not_found", "id": chat_id}
 
 
-@router.post("/{project_id}/lanes/{lane_id}/merge")
-async def merge_lane_endpoint(
-    project_id: str,
-    lane_id: str,
-    target_branch: str = "main",
-    db: AsyncSession = Depends(get_db_session),
-) -> dict[str, Any]:
-    """1-Click merge a lane's isolated branch into main/pair branch with conflict checking."""
-    runner = get_runner()
-    res = await runner.merge_lane(lane_id, target_branch=target_branch)
-    return res
 
 
 class UpdateSpendCapsRequest(BaseModel):

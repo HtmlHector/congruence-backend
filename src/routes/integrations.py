@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -33,6 +34,7 @@ from src.contexts.congruence.models import (
     Lane,
     Project,
     Publication,
+    VaultSecret,
 )
 from src.infrastructure.auth.dependencies import get_current_user
 from src.infrastructure.auth.harness_login import (
@@ -59,12 +61,13 @@ HARNESS_LABELS = {
     "codex": "Codex",
     "antigravity": "Antigravity",
     "opencode": "OpenCode",
+    "commandcode": "Command Code",
     "aider": "Aider",
 }
 
 
 class StartLoginRequest(BaseModel):
-    harness: str = Field(..., pattern="^(claude|codex|antigravity|opencode)$")
+    harness: str = Field(..., pattern="^(claude|codex|antigravity|opencode|commandcode)$")
 
 
 class ConnectPATRequest(BaseModel):
@@ -345,9 +348,12 @@ async def get_integrations_status(
     project_res = await db.execute(select(Project).where(Project.id == project_id))
     project = project_res.scalar_one_or_none()
     if not project:
+        fallback_res = await db.execute(select(Project).order_by(Project.created_at.desc()))
+        project = fallback_res.scalars().first()
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    host_res = await db.execute(select(Host).where(Host.project_id == project_id))
+    host_res = await db.execute(select(Host).where(Host.project_id == project.id))
     host = host_res.scalar_one_or_none()
     lanes_res = await db.execute(select(Lane).where(Lane.host_id == host.id if host else False))
     lane_ids = [lane.id for lane in lanes_res.scalars().all()]
@@ -356,6 +362,52 @@ async def get_integrations_status(
         h: "connected" if is_harness_credential_present(h) else "disconnected"
         for h in HARNESS_LABELS
     }
+    # Check Vault secrets and environment variables for provider keys
+    vault_res = await db.execute(
+        select(VaultSecret).where(
+            VaultSecret.is_active == True,
+            (
+                (VaultSecret.user_id == user.user_id)
+                | (VaultSecret.user_id == "user_default")
+                | (VaultSecret.workspace_id == project.id)
+                | (VaultSecret.workspace_id == project.organization_id)
+                | (VaultSecret.workspace_id.is_(None))
+            ),
+        )
+    )
+    vault_secrets = vault_res.scalars().all()
+    vault_keys = {s.key_name.strip().upper() for s in vault_secrets}
+    vault_providers = {s.provider.strip().lower() for s in vault_secrets}
+
+    if (
+        any(k in vault_keys for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+        or any(p in vault_providers for p in ("google", "gemini", "antigravity"))
+        or bool(os.environ.get("GEMINI_API_KEY"))
+        or bool(os.environ.get("GOOGLE_API_KEY"))
+    ):
+        harness_states["antigravity"] = "connected"
+
+    if (
+        any(k in vault_keys for k in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"))
+        or any(p in vault_providers for p in ("anthropic", "claude"))
+        or bool(os.environ.get("ANTHROPIC_API_KEY"))
+    ):
+        harness_states["claude"] = "connected"
+
+    if (
+        any(k in vault_keys for k in ("OPENAI_API_KEY", "CODEX_API_KEY"))
+        or any(p in vault_providers for p in ("openai", "codex"))
+        or bool(os.environ.get("OPENAI_API_KEY"))
+    ):
+        harness_states["codex"] = "connected"
+
+    if (
+        any(k in vault_keys for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"))
+        or bool(os.environ.get("OPENROUTER_API_KEY"))
+    ):
+        harness_states["opencode"] = "connected"
+        harness_states["aider"] = "connected"
+
     if lane_ids:
         auth_res = await db.execute(
             select(HarnessAuth).where(HarnessAuth.lane_id.in_(lane_ids))

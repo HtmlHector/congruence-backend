@@ -32,12 +32,24 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code || true
 
-# Install OpenAI Codex runner shim
-RUN printf '#!/usr/bin/env python3\nimport sys, os, json\nfrom pathlib import Path\ndef main():\n    args = sys.argv[1:]\n    codex_dir = Path.home() / ".codex"\n    codex_dir.mkdir(parents=True, exist_ok=True)\n    auth_file = codex_dir / "auth.json"\n    if not args or args[0] == "login":\n        print("\\033[1;36m◆ OpenAI Codex Authentication Gateway\\033[0m")\n        print("Authenticating with OpenAI Codex runner...")\n        token = os.environ.get("OPENAI_API_KEY", "")\n        if not token and not auth_file.exists():\n            print("\\033[0;90mEnter OpenAI API Key (or press Enter to link workspace runner):\\033[0m ", end="", flush=True)\n            try:\n                entered = input().strip()\n                if entered: token = entered\n            except EOFError: pass\n        if not token: token = "sk-congruence-local-" + os.urandom(8).hex()\n        auth_data = {"authenticated": True, "provider": "openai", "token": token, "updated_at": "2026-10-08T18:00:00Z"}\n        auth_file.write_text(json.dumps(auth_data, indent=2))\n        print("\\033[1;32m✓ OpenAI Codex linked successfully inside container.\\033[0m")\n        print(f"  Credentials saved to {auth_file}")\n    elif args[0] in ("status", "whoami"):\n        if auth_file.exists(): print("\\033[1;32m● Connected to OpenAI Codex\\033[0m")\n        else: print("\\033[1;31m○ Disconnected\\033[0m - Run `codex login` to authenticate.")\n    else: print(f"OpenAI Codex CLI: {\x27 \x27.join(args)}")\nif __name__ == "__main__": main()\n' > /usr/local/bin/codex && chmod +x /usr/local/bin/codex
+# Install official Google Antigravity CLI (agy)
+RUN curl -fsSL --compressed https://antigravity.google/cli/install.sh | bash -s -- -d /usr/local/bin \
+    && chmod +x /usr/local/bin/agy 2>/dev/null || true
 
-# Set up clean zsh prompt and config
-RUN mkdir -p /etc/zsh && echo 'export PROMPT="%F{cyan}➜ %F{green}%~%F{yellow} [container] %F{reset}%% "' >> /etc/zsh/zshrc
+# Install OpenAI Codex and OpenCode CLI harnesses
+COPY scripts/opencode_cli.py /usr/local/bin/opencode
+COPY scripts/codex_cli.py /usr/local/bin/codex
+RUN chmod +x /usr/local/bin/opencode /usr/local/bin/codex
+
+# Set up git safe directory and clean zsh/bash prompts
+RUN git config --system --add safe.directory "*" \
+    && mkdir -p /etc/zsh \
+    && echo 'export PROMPT="%F{cyan}➜ %F{green}%~%F{yellow} [container] %F{reset}%% "' >> /etc/zsh/zshrc \
+    && echo 'export PROMPT="%F{cyan}➜ %F{green}%~%F{yellow} [container] %F{reset}%% "' >> /root/.zshrc \
+    && echo 'export PS1="\[\033[01;32m\]➜ \[\033[01;34m\]\w \[\033[01;33m\][container]\[\033[00m\]\$ "' >> /etc/bash.bashrc \
+    && echo 'export PS1="\[\033[01;32m\]➜ \[\033[01;34m\]\w \[\033[01;33m\][container]\[\033[00m\]\$ "' >> /root/.bashrc
 
 WORKDIR /workspaces
 
 CMD ["sleep", "infinity"]
+

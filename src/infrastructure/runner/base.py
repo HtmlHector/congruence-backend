@@ -113,6 +113,10 @@ class HostBackend(ABC):
         """Terminate active PTY session."""
         ...
 
+    async def get_preview_target(self, lane_id: str, port: int, subpath: str) -> str:
+        """Resolve a safe API-process URL for a preview when runner networking supports it."""
+        raise NotImplementedError("Preview proxy target resolution is unsupported by this runner")
+
     @abstractmethod
     async def start_dev_server(
         self, lane_id: str, command: str, port: int = 3000

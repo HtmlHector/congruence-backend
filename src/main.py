@@ -24,6 +24,7 @@ from src.routes.projects import router as projects_router
 from src.routes.proxy import router as proxy_router
 from src.routes.session_ws import router as session_ws_router
 from src.routes.storage import router as storage_router
+from src.routes.vault import router as vault_router
 from src.routes.workspaces import router as workspaces_router
 
 logger = structlog.get_logger()
@@ -130,15 +131,16 @@ def create_app() -> FastAPI:
     app.include_router(storage_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")
     app.include_router(agents_router, prefix="/api/v1")
+    app.include_router(vault_router, prefix="/api/v1")
 
-    # Real-time WebSocket Gateway & Dev Preview Proxy
+    # Real-time WebSocket Gateway & Dev Preview Proxy (mounted first so /preview is never shadowed)
+    app.include_router(proxy_router)
+    app.include_router(session_ws_router)
+    app.include_router(session_ws_router, prefix="/api/v1")
     app.include_router(projects_router)
     app.include_router(integrations_router)
     app.include_router(agents_router)
-    app.include_router(session_ws_router)
-    app.include_router(session_ws_router, prefix="/api/v1")
-    app.include_router(proxy_router)
-
+    app.include_router(vault_router)
 
     return app
 

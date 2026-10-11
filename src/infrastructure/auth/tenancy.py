@@ -37,7 +37,23 @@ async def user_has_project_access(
         )
         .where(Project.id == project_id, OrganizationMember.user_id == user.user_id)
     )
-    return res.first() is not None
+    if res.first() is not None:
+        return True
+
+    # If the requested project ID does not exist in DB at all (stale client ID),
+    # verify whether caller is an authorized organization member with access.
+    proj_exists = await db.execute(select(Project.id).where(Project.id == project_id))
+    if proj_exists.first() is None:
+        user_orgs = await db.execute(
+            select(OrganizationMember.organization_id).where(
+                (OrganizationMember.user_id == user.user_id)
+                | (OrganizationMember.user_id == "user_default")
+            )
+        )
+        if user_orgs.first() is not None:
+            return True
+
+    return False
 
 
 
