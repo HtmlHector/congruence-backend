@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +16,37 @@ from svix.webhooks import Webhook
 from src.config.settings import settings
 
 logger = structlog.get_logger(__name__)
+
+_PUBLISHABLE_KEY_RE = re.compile(r"^pk_(?:test|live)_(.+)$")
+_FRONTEND_API_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+
+
+def derive_jwks_url(publishable_key: str | None) -> str | None:
+    """Derive the instance JWKS endpoint from a Clerk publishable key.
+
+    Clerk base64-encodes the frontend API host inside the publishable key, so the
+    two keys every Clerk app has are enough to verify session tokens without a
+    separate JWKS setting.
+    """
+    if not publishable_key:
+        return None
+
+    match = _PUBLISHABLE_KEY_RE.match(publishable_key.strip())
+    if not match:
+        return None
+
+    encoded = match.group(1)
+    padded = encoded + "=" * (-len(encoded) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+    host = decoded.removesuffix("$").strip().lower()
+    if not host or not _FRONTEND_API_HOST_RE.fullmatch(host):
+        return None
+
+    return f"https://{host}/.well-known/jwks.json"
 
 
 @dataclass(frozen=True)
@@ -37,7 +70,9 @@ class ClerkService:
         webhook_secret: str | None = None,
     ) -> None:
         self._secret_key = secret_key or settings.clerk.secret_key
-        self._jwks_url = jwks_url or settings.clerk.jwks_url
+        self._jwks_url = (
+            jwks_url or settings.clerk.jwks_url or derive_jwks_url(settings.clerk.publishable_key)
+        )
         self._webhook_secret = webhook_secret or settings.clerk.webhook_secret
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._jwk_client: PyJWKClient | None = None

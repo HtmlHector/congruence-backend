@@ -56,9 +56,19 @@ class WorkspaceRepository(AbstractRepository[Workspace]):
             select(WorkspaceModel)
             .join(WorkspaceMemberModel, WorkspaceModel.id == WorkspaceMemberModel.workspace_id)
             .where(WorkspaceMemberModel.user_id == user_id)
+            .order_by(WorkspaceMemberModel.created_at.desc())
         )
         result = await self._session.execute(query)
         return [self._to_entity(m) for m in result.scalars().all()]
+
+    async def get_member_role(self, workspace_id: UUID, user_id: UUID) -> WorkspaceRole | None:
+        """Return the user's role in a workspace, or None when not a member."""
+        query = select(WorkspaceMemberModel.role).where(
+            WorkspaceMemberModel.workspace_id == workspace_id,
+            WorkspaceMemberModel.user_id == user_id,
+        )
+        result = await self._session.execute(query)
+        return result.scalar_one_or_none()
 
     async def list_all(self, limit: int = 100, offset: int = 0) -> Sequence[Workspace]:
         query = select(WorkspaceModel).limit(limit).offset(offset)

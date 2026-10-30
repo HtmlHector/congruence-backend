@@ -39,7 +39,7 @@ In terminal 1:
 ```bash
 make dev
 ```
-Open interactive Swagger API docs at <http://localhost:8000/docs>.
+Open interactive Swagger API docs at <http://localhost:8001/docs>.
 
 In terminal 2 (optional for background events):
 ```bash
@@ -115,7 +115,7 @@ src/
 | Command | Description |
 | :--- | :--- |
 | `make setup` | Install all dependencies with `uv` and copy `.env.example` |
-| `make dev` | Start FastAPI server with hot-reload on `:8000` |
+| `make dev` | Start FastAPI server with hot-reload on `:8001` |
 | `make dev-worker` | Run background event worker pool |
 | `make test` | Run test suite with pytest (in-memory async DB) |
 | `make lint` | Run ruff code linter |

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.contexts.identity.domain.entities import User
 from src.contexts.identity.infrastructure.repository import UserRepository
+from src.contexts.workspace.application.service import WorkspaceService
 from src.infrastructure.auth.clerk import ClerkClaims, clerk_service
 
 logger = structlog.get_logger(__name__)
@@ -42,7 +43,14 @@ class IdentityService:
             last_name=profile.get("last_name"),
             avatar_url=profile.get("image_url"),
         )
-        return await self._repo.add(user)
+        created = await self._repo.add(user)
+        await self._create_personal_workspace(created)
+        return created
+
+    async def _create_personal_workspace(self, user: User) -> None:
+        """Give brand-new accounts a workspace so signing in always lands somewhere."""
+        await WorkspaceService(self._session).create_workspace(name="Personal", owner_id=user.id)
+        logger.info("personal_workspace_created", user_id=str(user.id))
 
     async def sync_clerk_webhook(self, event_type: str, data: dict) -> User | None:
         """Sync user state from Svix-verified Clerk webhook."""
@@ -69,7 +77,9 @@ class IdentityService:
                     last_name=data.get("last_name"),
                     avatar_url=data.get("image_url"),
                 )
-                return await self._repo.add(new_user)
+                created = await self._repo.add(new_user)
+                await self._create_personal_workspace(created)
+                return created
 
         elif event_type == "user.deleted":
             existing = await self._repo.get_by_clerk_id(clerk_id)

@@ -47,7 +47,7 @@ def upgrade() -> None:
     op.create_index('ix_workspaces_slug', 'workspaces', ['slug'])
 
     # 3. Workspace members table
-    workspace_role_enum = postgresql.ENUM('OWNER', 'ADMIN', 'MEMBER', name='workspace_role', create_type=True)
+    workspace_role_enum = postgresql.ENUM('OWNER', 'ADMIN', 'MEMBER', name='workspace_role', create_type=False)
     workspace_role_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
@@ -64,10 +64,10 @@ def upgrade() -> None:
     op.create_index('ix_workspace_members_user_id', 'workspace_members', ['user_id'])
 
     # 4. Subscriptions table
-    plan_tier_enum = postgresql.ENUM('FREE', 'PRO', 'ENTERPRISE', name='plan_tier', create_type=True)
+    plan_tier_enum = postgresql.ENUM('FREE', 'PRO', 'ENTERPRISE', name='plan_tier', create_type=False)
     plan_tier_enum.create(op.get_bind(), checkfirst=True)
 
-    sub_status_enum = postgresql.ENUM('ACTIVE', 'TRIALING', 'PAST_DUE', 'CANCELED', 'INCOMPLETE', name='subscription_status', create_type=True)
+    sub_status_enum = postgresql.ENUM('ACTIVE', 'TRIALING', 'PAST_DUE', 'CANCELED', 'INCOMPLETE', name='subscription_status', create_type=False)
     sub_status_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
@@ -103,7 +103,7 @@ def upgrade() -> None:
     op.create_index('ix_audit_logs_actor_id', 'audit_logs', ['actor_id'])
 
     # 6. Projects sample table
-    project_status_enum = postgresql.ENUM('DRAFT', 'ACTIVE', 'ARCHIVED', name='project_status', create_type=True)
+    project_status_enum = postgresql.ENUM('DRAFT', 'ACTIVE', 'ARCHIVED', name='project_status', create_type=False)
     project_status_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(

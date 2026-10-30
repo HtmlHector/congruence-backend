@@ -22,14 +22,14 @@ def upgrade() -> None:
     integration_provider_enum = postgresql.ENUM(
         'GITHUB', 'SLACK', 'LINEAR', 'CUSTOM_WEBHOOK', 'CUSTOM_API_KEY',
         name='integration_provider',
-        create_type=True
+        create_type=False
     )
     integration_provider_enum.create(op.get_bind(), checkfirst=True)
 
     credential_type_enum = postgresql.ENUM(
         'OAUTH_TOKEN', 'API_KEY', 'WEBHOOK_SECRET',
         name='credential_type',
-        create_type=True
+        create_type=False
     )
     credential_type_enum.create(op.get_bind(), checkfirst=True)
 

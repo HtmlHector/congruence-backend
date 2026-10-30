@@ -32,6 +32,10 @@ ENV/
 .env.local
 .env.*.local
 
+# GitHub App private key and other local secrets
+secrets/
+*.pem
+
 # Testing and coverage
 .pytest_cache/
 .coverage

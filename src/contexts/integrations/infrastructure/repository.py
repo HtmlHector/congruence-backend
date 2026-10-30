@@ -38,6 +38,7 @@ class IntegrationRepository:
             encrypted_value=model.encrypted_value,
             scopes=list(model.scopes),
             expires_at=model.expires_at,
+            refresh_token_encrypted=model.refresh_token_encrypted,
             metadata=dict(model.metadata_),
             is_active=model.is_active,
         )
@@ -89,6 +90,7 @@ class IntegrationRepository:
             model.encrypted_value = entity.encrypted_value
             model.scopes = entity.scopes
             model.expires_at = entity.expires_at
+            model.refresh_token_encrypted = entity.refresh_token_encrypted
             model.metadata_ = entity.metadata
             model.is_active = entity.is_active
             model.updated_at = entity.updated_at
@@ -103,6 +105,7 @@ class IntegrationRepository:
                 encrypted_value=entity.encrypted_value,
                 scopes=entity.scopes,
                 expires_at=entity.expires_at,
+                refresh_token_encrypted=entity.refresh_token_encrypted,
                 metadata_=entity.metadata,
                 is_active=entity.is_active,
             )

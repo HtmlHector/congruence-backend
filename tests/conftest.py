@@ -13,6 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 os.environ["APP_ENVIRONMENT"] = "test"
 os.environ["DATABASE_ENABLE_RLS"] = "false"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+# Never reach api.github.com from a test: the GitHub App stays unconfigured unless
+# a test constructs a client explicitly.
+os.environ["INTEGRATIONS_GITHUB_APP_ID"] = "gh_app_id_placeholder"
+os.environ["INTEGRATIONS_GITHUB_PRIVATE_KEY_PATH"] = "secrets/unused-in-tests.pem"
 
 from src.adapters.api.dependencies import get_active_tenant, get_current_claims, get_current_user
 from src.bootstrap.api import app

@@ -18,12 +18,30 @@ class ProjectStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class SetupStatus(StrEnum):
+    """Progress of the project's one-time environment setup."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    READY = "ready"
+    FAILED = "failed"
+
+
 @dataclass
 class Project(BaseAggregateRoot):
-    """Sample domain entity demonstrating DDD and multi-tenancy."""
+    """A project bound to one repository and one persistent devbox."""
 
     workspace_id: UUID | None = None
     name: str = ""
     description: str | None = None
     status: ProjectStatus = ProjectStatus.DRAFT
     metadata: dict[str, Any] = field(default_factory=dict)
+    repository_id: str | None = None
+    repo_provider: str = "github"
+    default_branch: str = "main"
+    root_path: str = ""
+    setup_command: str | None = None
+    setup_status: SetupStatus = SetupStatus.PENDING
+    setup_log_ref: str | None = None
+    base_image_ref: str | None = None
+    created_by: str | None = None

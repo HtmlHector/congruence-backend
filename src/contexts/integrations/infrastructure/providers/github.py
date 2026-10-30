@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 import structlog
@@ -36,13 +37,16 @@ class GitHubProvider:
     ) -> str:
         """Construct GitHub OAuth authorization redirect URL."""
         scope_str = " ".join(scopes or ["repo", "read:user", "user:email"])
-        params = {
-            "client_id": self.client_id,
-            "redirect_uri": redirect_uri,
-            "scope": scope_str,
-            "state": state,
-        }
-        query = "&".join(f"{k}={v}" for k, v in params.items())
+        # urlencode matters: a redirect URI with its own query string would
+        # otherwise leak its params into the authorize request.
+        query = urlencode(
+            {
+                "client_id": self.client_id,
+                "redirect_uri": redirect_uri,
+                "scope": scope_str,
+                "state": state,
+            }
+        )
         return f"{self.AUTH_URL}?{query}"
 
     async def exchange_code(self, code: str, redirect_uri: str) -> dict[str, Any]:

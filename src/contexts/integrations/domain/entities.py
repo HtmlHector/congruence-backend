@@ -16,6 +16,8 @@ class IntegrationProvider(StrEnum):
     """Supported integration providers."""
 
     GITHUB = "github"
+    GITLAB = "gitlab"
+    BITBUCKET = "bitbucket"
     SLACK = "slack"
     LINEAR = "linear"
     WEBHOOK = "webhook"
@@ -40,6 +42,8 @@ class IntegrationCredential(BaseAggregateRoot):
     encrypted_value: str = ""
     scopes: list[str] = field(default_factory=list)
     expires_at: datetime | None = None
+    # Rotation token for providers whose access tokens expire (GitLab, Bitbucket).
+    refresh_token_encrypted: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     is_active: bool = True
 

@@ -1,0 +1,48 @@
+# Devbox image for DEVBOX_PROVIDER=local.
+#
+# Build:  make devbox-image   (docker build -f docker/Dockerfile.devbox -t congruence/devbox:dev .)
+# Boot:   docker run -d --name cng-<project>-<box> -v <name>-workspaces:/workspaces congruence/devbox:dev
+#
+# The container hosts one project's clone at /workspaces/<project-slug> plus its
+# git worktrees under /workspaces/<project-slug>/wt/<slug>. It is kept alive by
+# `sleep infinity` so the control plane can `docker exec` / `docker pause` it.
+
+FROM node:22-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        git-lfs \
+        jq \
+        less \
+        openssh-client \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        tmux \
+        vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Worktrees are created by the control plane as a different UID than the files
+# it may inherit from a mounted volume, so trust the mounted workspace.
+RUN git config --system --add safe.directory '*'
+
+# Coding-agent CLIs, so a shell in the box is immediately useful.
+RUN npm install -g \
+        pnpm@9 \
+        @anthropic-ai/claude-code \
+        @openai/codex \
+        @google/gemini-cli
+
+# Antigravity CLI ships as a standalone binary rather than an npm package.
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /workspaces
+
+CMD ["sleep", "infinity"]

@@ -51,9 +51,7 @@ class TenantScopedRepository[TModel: Base, TEntity: BaseEntity](AbstractReposito
         model = await self._session.get(self._model_cls, entity_id)
         return self._to_entity(model) if model else None
 
-    async def get_by_id_and_workspace(
-        self, entity_id: UUID, workspace_id: UUID
-    ) -> TEntity | None:
+    async def get_by_id_and_workspace(self, entity_id: UUID, workspace_id: UUID) -> TEntity | None:
         """Fetch entity strictly bounded to workspace_id."""
         query = select(self._model_cls).where(
             self._model_cls.id == entity_id,  # type: ignore[attr-defined]

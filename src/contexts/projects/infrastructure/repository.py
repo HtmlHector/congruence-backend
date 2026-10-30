@@ -29,6 +29,15 @@ class ProjectRepository(AbstractRepository[Project]):
             description=model.description,
             status=model.status,
             metadata=dict(model.metadata_),
+            repository_id=model.repository_id,
+            repo_provider=model.repo_provider,
+            default_branch=model.default_branch,
+            root_path=model.root_path,
+            setup_command=model.setup_command,
+            setup_status=model.setup_status,
+            setup_log_ref=model.setup_log_ref,
+            base_image_ref=model.base_image_ref,
+            created_by=model.created_by,
         )
 
     async def get_by_id(self, entity_id: UUID) -> Project | None:
@@ -77,6 +86,15 @@ class ProjectRepository(AbstractRepository[Project]):
             description=entity.description,
             status=entity.status,
             metadata_=entity.metadata,
+            repository_id=entity.repository_id,
+            repo_provider=entity.repo_provider,
+            default_branch=entity.default_branch,
+            root_path=entity.root_path,
+            setup_command=entity.setup_command,
+            setup_status=entity.setup_status,
+            setup_log_ref=entity.setup_log_ref,
+            base_image_ref=entity.base_image_ref,
+            created_by=entity.created_by,
         )
         self._session.add(model)
         await self._session.flush()
@@ -90,6 +108,15 @@ class ProjectRepository(AbstractRepository[Project]):
         model.description = entity.description
         model.status = entity.status
         model.metadata_ = entity.metadata
+        model.repository_id = entity.repository_id
+        model.repo_provider = entity.repo_provider
+        model.default_branch = entity.default_branch
+        model.root_path = entity.root_path
+        model.setup_command = entity.setup_command
+        model.setup_status = entity.setup_status
+        model.setup_log_ref = entity.setup_log_ref
+        model.base_image_ref = entity.base_image_ref
+        model.created_by = entity.created_by
         model.updated_at = entity.updated_at
         await self._session.flush()
         return self._to_entity(model)

@@ -9,7 +9,8 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.contexts.audit.application.service import AuditService
-from src.contexts.projects.domain.entities import Project, ProjectStatus
+from src.contexts.devbox.domain.entities import Devbox
+from src.contexts.projects.domain.entities import Project, ProjectStatus, SetupStatus
 from src.contexts.projects.domain.events import (
     ProjectCreatedEvent,
     ProjectUpdatedEvent,
@@ -41,14 +42,26 @@ class ProjectService:
         name: str,
         description: str | None = None,
         metadata: dict[str, Any] | None = None,
+        repository_id: str | None = None,
+        repo_provider: str = "github",
+        default_branch: str = "main",
+        root_path: str = "",
+        setup_command: str | None = None,
     ) -> Project:
-        """Create a new project, dispatch realtime and bus events, and record audit entry."""
+        """Create a new project, provision its devbox, and record audit/realtime events."""
         project = Project(
             workspace_id=workspace_id,
             name=name,
             description=description,
             status=ProjectStatus.ACTIVE,
             metadata=metadata or {},
+            repository_id=repository_id,
+            repo_provider=repo_provider,
+            default_branch=default_branch,
+            root_path=root_path,
+            setup_command=setup_command,
+            setup_status=SetupStatus.PENDING,
+            created_by=actor_id,
         )
         project.record_event(
             ProjectCreatedEvent(
@@ -88,7 +101,72 @@ class ProjectService:
             workspace_id=str(workspace_id),
         )
 
+        if saved.repository_id:
+            box = await self._provision_devbox(saved, actor_id)
+            if box is not None:
+                await self._create_primary_worktree(saved, box, actor_id)
+
         return saved
+
+    async def _provision_devbox(self, project: Project, actor_id: str) -> Devbox | None:
+        """Best-effort devbox provisioning; failures are surfaced via setup_status.
+
+        Returns the live box when the repository checkout is usable. A failing setup
+        command still leaves a clone behind, so that case keeps the box and lets the
+        project open on the checkout while the user fixes setup.
+        """
+        from src.contexts.devbox.application.service import DevboxError, DevboxService
+
+        service = DevboxService(self._session)
+        try:
+            return await service.get_or_provision(project)
+        except DevboxError as exc:
+            project.setup_status = SetupStatus.FAILED
+            await self._repo.update(project)
+            if project.workspace_id:
+                await self._audit.record(
+                    workspace_id=project.workspace_id,
+                    actor_id=actor_id,
+                    action="project.provision_failed",
+                    resource_type="project",
+                    resource_id=str(project.id),
+                    payload={"code": exc.code},
+                )
+            if exc.code != "SETUP_FAILED" or project.workspace_id is None:
+                return None
+            return await service.get_live(project.id, project.workspace_id)
+
+    async def _create_primary_worktree(
+        self, project: Project, box: Devbox, actor_id: str
+    ) -> None:
+        """Give every provisioned project a primary (root checkout) worktree."""
+        from src.contexts.worktrees.application.service import WorktreeError, WorktreeService
+
+        try:
+            await WorktreeService(self._session).create_primary(project, actor_id, box)
+        except WorktreeError as exc:
+            logger.warning(
+                "primary_worktree_create_failed",
+                project_id=str(project.id),
+                code=exc.code,
+                error=str(exc),
+            )
+
+    async def _destroy_devbox(self, project_id: UUID, workspace_id: UUID, actor_id: str) -> None:
+        """Tear down the project's devbox so containers are not leaked on delete."""
+        from src.contexts.devbox.application.service import DevboxError, DevboxService
+        from src.contexts.devbox.infrastructure.providers.base import ProviderError
+
+        devbox_service = DevboxService(self._session)
+        box = await devbox_service.get_live(project_id, workspace_id)
+        if box is None:
+            return
+        try:
+            await devbox_service.destroy(box, actor_id=actor_id)
+        except ProviderError as exc:
+            logger.warning("devbox_destroy_failed", project_id=str(project_id), error=str(exc))
+        except DevboxError as exc:
+            logger.warning("devbox_destroy_failed", project_id=str(project_id), error=exc.code)
 
     async def get_project(self, project_id: UUID, workspace_id: UUID) -> Project | None:
         """Fetch project ensuring tenant isolation."""
@@ -114,6 +192,8 @@ class ProjectService:
         description: str | None = None,
         status: ProjectStatus | None = None,
         metadata: dict[str, Any] | None = None,
+        default_branch: str | None = None,
+        setup_command: str | None = None,
     ) -> Project | None:
         """Update an existing project."""
         project = await self._repo.get_by_id_and_workspace(project_id, workspace_id)
@@ -128,6 +208,10 @@ class ProjectService:
             project.status = status
         if metadata is not None:
             project.metadata = metadata
+        if default_branch is not None:
+            project.default_branch = default_branch
+        if setup_command is not None:
+            project.setup_command = setup_command
 
         project.record_event(ProjectUpdatedEvent(project_id=project.id, workspace_id=workspace_id))
         updated = await self._repo.update(project)
@@ -168,6 +252,8 @@ class ProjectService:
         project = await self._repo.get_by_id_and_workspace(project_id, workspace_id)
         if not project:
             return False
+
+        await self._destroy_devbox(project_id, workspace_id, actor_id)
 
         success = await self._repo.delete(project_id)
         if success:

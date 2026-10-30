@@ -8,6 +8,8 @@ import os
 import structlog
 from cryptography.fernet import Fernet
 
+from src.config.settings import settings
+
 logger = structlog.get_logger(__name__)
 
 
@@ -20,7 +22,7 @@ class EncryptionService:
     """Symmetric encryption helper for secrets and tokens."""
 
     def __init__(self, key: str | None = None) -> None:
-        raw_key = key or os.getenv("ENCRYPTION_KEY")
+        raw_key = key or settings.encryption_key or os.getenv("ENCRYPTION_KEY")
         if not raw_key:
             # Deterministic development fallback key
             raw_key = base64.urlsafe_b64encode(b"0" * 32).decode("utf-8")

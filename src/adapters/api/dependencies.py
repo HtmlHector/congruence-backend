@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.contexts.identity.application.service import IdentityService
 from src.contexts.identity.domain.entities import User
+from src.contexts.workspace.infrastructure.repository import WorkspaceRepository
 from src.infrastructure.auth.clerk import ClerkClaims, clerk_service
 from src.infrastructure.database.rls import bind_rls_workspace
 from src.infrastructure.database.session import get_db
@@ -21,9 +24,11 @@ async def get_current_claims(
 ) -> ClerkClaims:
     """Verify Bearer token and return verified Clerk claims."""
     if not credentials:
-        # Development fallback
-        claims = await clerk_service.verify_token("mock_token")
-        return claims
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     try:
         claims = await clerk_service.verify_token(credentials.credentials)
@@ -50,14 +55,33 @@ async def get_active_tenant(
     session: AsyncSession = Depends(get_db),
     x_workspace_id: str | None = Header(None, alias="X-Workspace-Id"),
 ) -> TenantContext:
-    """Resolve and bind active workspace tenant context to active DB transaction."""
+    """Resolve, verify, and bind the active workspace to the DB transaction.
+
+    The header is client-supplied, so membership is checked before any query runs;
+    an unknown or foreign workspace is indistinguishable from a missing one.
+    """
     workspace_id = x_workspace_id or claims.org_id or getattr(request.state, "workspace_id", None)
     if not workspace_id:
-        workspace_id = "00000000-0000-0000-0000-000000000001"
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No active workspace context"
+        )
+
+    try:
+        workspace_uuid = UUID(workspace_id)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found"
+        ) from exc
+
+    user = await IdentityService(session).get_or_provision_user(claims)
+    role = await WorkspaceRepository(session).get_member_role(workspace_uuid, user.id)
+    if role is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
     tenant = TenantContext(
-        workspace_id=workspace_id,
+        workspace_id=str(workspace_uuid),
         user_id=claims.user_id,
+        role=role.value,
     )
     set_current_tenant(tenant)
     await bind_rls_workspace(session, tenant)

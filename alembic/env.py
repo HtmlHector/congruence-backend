@@ -15,6 +15,12 @@ from src.contexts.workspace.infrastructure.models import WorkspaceModel, Workspa
 from src.contexts.billing.infrastructure.models import SubscriptionModel
 from src.contexts.audit.infrastructure.models import AuditLogModel
 from src.contexts.projects.infrastructure.models import ProjectModel
+from src.contexts.devbox.infrastructure.models import DevboxModel
+from src.contexts.worktrees.infrastructure.models import WorktreeModel
+from src.contexts.terminals.infrastructure.models import TerminalChunkModel, TerminalModel
+from src.contexts.credentials.infrastructure.models import AgentCredentialModel
+from src.contexts.environments.infrastructure.models import EnvVarModel
+from src.contexts.usage.infrastructure.models import UsageRecordModel
 from src.contexts.integrations.infrastructure.models import (
     IntegrationCredentialModel,
     IntegrationConfigModel,

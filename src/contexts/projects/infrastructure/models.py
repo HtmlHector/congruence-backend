@@ -9,7 +9,7 @@ from sqlalchemy import JSON, ForeignKey, String, Text, Uuid
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.contexts.projects.domain.entities import ProjectStatus
+from src.contexts.projects.domain.entities import ProjectStatus, SetupStatus
 from src.infrastructure.database.base import Base, CommonColumns
 
 
@@ -35,3 +35,17 @@ class ProjectModel(Base, CommonColumns):
     metadata_: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSON, default=dict, nullable=False
     )
+    repository_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    repo_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="github")
+    default_branch: Mapped[str] = mapped_column(String(255), nullable=False, default="main")
+    root_path: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    setup_command: Mapped[str | None] = mapped_column(Text, nullable=True)
+    setup_status: Mapped[SetupStatus] = mapped_column(
+        SQLEnum(SetupStatus, name="setup_status"),
+        nullable=False,
+        default=SetupStatus.PENDING,
+        index=True,
+    )
+    setup_log_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    base_image_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
