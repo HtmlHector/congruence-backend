@@ -31,7 +31,7 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://parabox:parabox@localhost:5432/parabox_test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
